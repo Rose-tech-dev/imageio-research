@@ -2,7 +2,7 @@ name: ImageIO Crash Test (macOS)
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, master ]
   workflow_dispatch:
 
 jobs:
