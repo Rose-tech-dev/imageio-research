@@ -470,7 +470,14 @@ def build_dng(width=64, height=64, spp=3, inner_comps=1,
 
 CORPUS = [
     # (width, height, spp, inner_comps, bits, codec, name)
-    # J2K primary targets
+    # ---- CONTROL cases: spp == inner_comps (matched, should decode without error) ----
+    # If these return rc=13, the stub bitstream itself is invalid.
+    # If these return rc=0 and mismatch cases return rc=13, codec IS reaching OOB point.
+    (64,   64,   1, 1, 16, COMP_JPEG2000, 'CTRL_j2k_1spp_1csiz_16b'),
+    (64,   64,   3, 3, 16, COMP_JPEG2000, 'CTRL_j2k_3spp_3csiz_16b'),
+    (64,   64,   1, 1,  8, COMP_JPEG_LS,  'CTRL_jpegls_1spp_1nf_8b'),
+    (64,   64,   3, 3,  8, COMP_JPEG_LS,  'CTRL_jpegls_3spp_3nf_8b'),
+    # ---- J2K primary mismatch targets ----
     (64,   64,   3, 1,  8, COMP_JPEG2000, 'j2k_3spp_1csiz_8b'),
     (64,   64,   3, 1, 16, COMP_JPEG2000, 'j2k_3spp_1csiz_16b'),
     (64,   64,   4, 1, 16, COMP_JPEG2000, 'j2k_4spp_1csiz_16b'),
@@ -478,14 +485,14 @@ CORPUS = [
     (512, 512,   3, 1, 16, COMP_JPEG2000, 'j2k_3spp_1csiz_16b_512'),
     (64,   64,   4, 2, 16, COMP_JPEG2000, 'j2k_4spp_2csiz_16b'),
     (64,   64,   6, 1, 16, COMP_JPEG2000, 'j2k_6spp_1csiz_16b'),
-    (64,   64,   3, 0,  8, COMP_JPEG2000, 'j2k_3spp_0csiz_edge'),   # csiz=0
-    (4096, 4096, 3, 1, 16, COMP_JPEG2000, 'j2k_3spp_1csiz_16b_4k'), # max overflow
-    # JPEG-LS targets
+    (64,   64,   3, 0,  8, COMP_JPEG2000, 'j2k_3spp_0csiz_edge'),
+    (4096, 4096, 3, 1, 16, COMP_JPEG2000, 'j2k_3spp_1csiz_16b_4k'),
+    # ---- JPEG-LS mismatch targets ----
     (64,   64,   3, 1,  8, COMP_JPEG_LS,  'jpegls_3spp_1nf_8b'),
     (64,   64,   4, 1,  8, COMP_JPEG_LS,  'jpegls_4spp_1nf_8b'),
     (256, 256,   3, 1,  8, COMP_JPEG_LS,  'jpegls_3spp_1nf_8b_256'),
     (64,   64,   3, 2,  8, COMP_JPEG_LS,  'jpegls_3spp_2nf_8b'),
-    # Patched reference
+    # ---- Patched reference ----
     (64,   64,   2, 1, 16, COMP_JPEG_LOSSLESS, 'jpegl_2spp_1nf_PATCHED_ref'),
 ]
 
