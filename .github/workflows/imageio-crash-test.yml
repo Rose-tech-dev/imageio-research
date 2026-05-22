@@ -41,15 +41,22 @@ jobs:
           results = []
 
           files = sorted(f for f in os.listdir(corpus_dir) if f.endswith('.dng'))
-          print(f"Testing {len(files)} files with sips...\n")
+          print(f"Testing {len(files)} files with sips (forced pixel decode)...\n")
+
+          out_png = '/tmp/sips_out.png'
 
           for fname in files:
               path = os.path.join(corpus_dir, fname)
               t0 = time.time()
               try:
+                  # Force full pixel decode by exporting to PNG — this invokes the codec
                   r = subprocess.run(
-                      ['sips', '-g', 'all', path],
-                      capture_output=True, text=True, timeout=15
+                      ['sips', '-s', 'format', 'png', path, '--out', out_png],
+                      capture_output=True, text=True, timeout=30,
+                      env={**os.environ,
+                           'MallocScribble': '1',
+                           'MallocGuardEdges': '1',
+                           'ASAN_OPTIONS': 'detect_oob_reads=1:halt_on_error=0'},
                   )
                   elapsed = time.time() - t0
                   status = 'CRASH' if r.returncode != 0 else 'OK'
@@ -128,14 +135,14 @@ jobs:
       - name: Check AddressSanitizer output (if available)
         if: always()
         run: |
-          # Re-run the highest-priority file with ASAN_OPTIONS for better crash detail
-          for f in corpus/j2k_3spp_1csiz_16b_512.dng corpus/j2k_4spp_1csiz_16b.dng; do
+          # Re-run highest-priority files with ASAN env vars — force pixel decode
+          for f in corpus/j2k_3spp_1csiz_16b_512.dng corpus/j2k_4spp_1csiz_16b.dng corpus/jpegls_3spp_1nf_8b_256.dng; do
             [ -f "$f" ] || continue
-            echo "=== ASAN run: $f ==="
-            ASAN_OPTIONS=detect_oob_reads=1 \
+            echo "=== ASAN decode: $f ==="
+            ASAN_OPTIONS=detect_oob_reads=1:halt_on_error=0 \
             MallocScribble=1 \
             MallocGuardEdges=1 \
-            sips -g all "$f" 2>&1 | head -30 || true
+            sips -s format png "$f" --out /tmp/asan_out.png 2>&1 | head -40 || true
           done
 
       - name: Upload crash artifacts
