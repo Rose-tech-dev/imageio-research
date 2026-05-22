@@ -8,7 +8,7 @@ on:
 jobs:
   crash-test:
     runs-on: macos-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
@@ -56,30 +56,33 @@ jobs:
             fi
           done
 
-      - name: DIAGNOSTIC - qlmanage (QuickLook / ImageIO pipeline)
+      - name: DIAGNOSTIC - qlmanage (QuickLook / ImageIO pipeline, 8s timeout each)
         if: always()
         run: |
           echo ""
           echo "======================================================"
-          echo " qlmanage -t (thumbnail via ImageIO — different path than sips)"
-          echo " rc=0 → DNG plugin rendered successfully"
-          echo " rc!=0 → DNG plugin cannot render (missing tags / wrong format)"
+          echo " qlmanage -t (thumbnail — different path than sips, 8s max each)"
+          echo " OK → DNG/TIFF plugin rendered successfully"
+          echo " TIMEOUT → plugin hung (possibly infinite loop bug)"
+          echo " ERR → plugin rejected the file"
           echo "======================================================"
           mkdir -p /tmp/ql_out
           for f in corpus/DIAG_plain_tiff_rgb_8b.dng \
-                   corpus/DIAG_dng_cfa_uncompressed.dng \
-                   corpus/CTRL_cfa_jpegl_1spp_1nf_16b.dng \
                    corpus/CTRL_tiff_jpegl_3spp_3nf_16b.dng \
-                   corpus/tiff_jpegl_3spp_1nf_16b.dng; do
+                   corpus/tiff_jpegl_3spp_1nf_16b.dng \
+                   corpus/DIAG_dng_cfa_uncompressed.dng \
+                   corpus/CTRL_cfa_jpegl_1spp_1nf_16b.dng; do
             [ -f "$f" ] || continue
             fname=$(basename "$f")
-            out=$(qlmanage -t -s 64 -o /tmp/ql_out "$f" 2>&1)
+            out=$(timeout 8 qlmanage -t -s 64 -o /tmp/ql_out "$f" 2>&1)
             rc=$?
             if [ $rc -eq 0 ]; then
-              echo "  [QL-OK]  $fname"
+              echo "  [QL-OK]      $fname"
+            elif [ $rc -eq 124 ]; then
+              echo "  [QL-TIMEOUT] $fname  ← potential infinite loop"
             else
               echo "  [QL-ERR rc=$rc] $fname"
-              echo "    $out" | head -3
+              echo "$out" | head -2 | sed 's/^/    /'
             fi
           done
 
