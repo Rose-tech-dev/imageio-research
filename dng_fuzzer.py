@@ -67,6 +67,7 @@ TY_LONG     = 4
 TY_RATIONAL = 5
 TY_SRATIONAL = 10
 
+COMP_UNCOMPRESSED  = 1
 COMP_JPEG_LOSSLESS = 7
 COMP_JPEG2000      = 34712
 COMP_JPEG_LS       = 34892
@@ -445,7 +446,11 @@ def build_dng(width=64, height=64, spp=3, inner_comps=1,
     b.add_short(T_BLACK_LEVEL, 0)
     b.add_long(T_WHITE_LEVEL, (1 << bits) - 1)
 
-    if codec == COMP_JPEG2000:
+    if codec == COMP_UNCOMPRESSED:
+        # Raw pixel data: width*height*spp samples of zeros
+        payload = bytes(width * height * spp * (bits // 8))
+        label = 'Uncompressed'
+    elif codec == COMP_JPEG2000:
         payload = build_j2k(width, height, csiz=inner_comps, bits=bits)
         label = f'J2K csiz={inner_comps}'
     elif codec == COMP_JPEG_LS:
@@ -490,6 +495,12 @@ def build_dng(width=64, height=64, spp=3, inner_comps=1,
 
 CORPUS = [
     # (width, height, spp, inner_comps, bits, codec, name)
+    #
+    # ---- STRUCTURE CHECK: uncompressed DNG (should always decode) ----
+    # If this fails rc=13, DNG structure itself is wrong.
+    # If this succeeds rc=0, DNG structure is fine, issue is codec routing.
+    (8,   8,  1, 1, 16, COMP_UNCOMPRESSED, 'DIAG_uncompressed_1spp_16b'),
+    (8,   8,  3, 3, 16, COMP_UNCOMPRESSED, 'DIAG_uncompressed_3spp_16b'),
     #
     # ---- JPEG-Lossless (SOF3, compression=7) ----
     # Same code path as CVE-2025-43300. Valid bitstream, mismatch in Nf vs SPP.
