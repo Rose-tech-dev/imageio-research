@@ -34,6 +34,7 @@ jobs:
 
       - name: DIAGNOSTIC - file type and Swift CGImageSource (direct ImageIO)
         if: always()
+        continue-on-error: true
         run: |
           echo "======================================================"
           echo " file(1) magic-byte type detection"
@@ -53,7 +54,7 @@ jobs:
           # \( in Swift string interpolation is kept literal via Python list-of-strings
           lines = [
               'import Foundation',
-              'import CoreGraphics',
+              'import ImageIO',
               '',
               'let dir = "corpus"',
               'guard let entries = try? FileManager.default.contentsOfDirectory(atPath: dir) else {',
@@ -207,18 +208,21 @@ jobs:
           results = []
 
           files = sorted(f for f in os.listdir(corpus_dir) if f.endswith('.dng'))
-          print(f"Testing {len(files)} files with sips (forced pixel decode to PNG)...\n")
+          # Use jpeg output: the sips format matrix showed jpeg=0 for TIFF+JPEGL files
+          # while png/bmp/tiff all return rc=13 (codec rejects those pixel-format paths).
+          # jpeg output forces the JPEG-Lossless decoder to actually run so we can see crashes.
+          print(f"Testing {len(files)} files with sips -s format jpeg (forces JPEGL decode)...\n")
           print(f"{'File':<55} {'Status':>8}  {'RC':>5}  {'Time':>6}")
           print("-" * 80)
 
-          out_png = '/tmp/sips_out.png'
+          out_jpeg = '/tmp/sips_out.jpeg'
 
           for fname in files:
               path = os.path.join(corpus_dir, fname)
               t0 = time.time()
               try:
                   r = subprocess.run(
-                      ['sips', '-s', 'format', 'png', path, '--out', out_png],
+                      ['sips', '-s', 'format', 'jpeg', path, '--out', out_jpeg],
                       capture_output=True, text=True, timeout=30,
                       env={**os.environ,
                            'MallocScribble': '1',
@@ -315,6 +319,70 @@ jobs:
           # Fail the step on crashes/hangs to make them easy to spot
           if crashes or hangs:
               sys.exit(1)
+          PYEOF
+
+      - name: DIAGNOSTIC - decode output analysis (detect silent OOB via channel count)
+        if: always()
+        run: |
+          python3 << 'PYEOF'
+          import subprocess, os
+
+          # For mismatch files that return rc=0 with jpeg output, check the OUTPUT JPEG.
+          # If SPP=1 (1-channel buffer allocated) but Nf=3 (JPEGL writes 3 channels):
+          #   - output has 3 channels → decoder ignored SPP, used Nf (no OOB or silent OOB)
+          #   - output has 1 channel  → decoder correctly truncated at SPP=1
+          #   - output is invalid     → decoder corrupted the buffer
+          cases = [
+              # (file, spp, nf, expected_channels_if_no_bug)
+              ('corpus/DIAG_plain_tiff_rgb_8b.dng',       3, 3, 3),
+              ('corpus/CTRL_tiff_jpegl_1spp_1nf_8b.dng',  1, 1, 1),
+              ('corpus/CTRL_tiff_jpegl_3spp_3nf_8b.dng',  3, 3, 3),
+              ('corpus/tiff_jpegl_1spp_3nf_8b.dng',        1, 3, '?'),  # OOB WRITE target
+              ('corpus/tiff_jpegl_3spp_1nf_8b.dng',        3, 1, '?'),  # OOB READ target
+              ('corpus/tiff_jpegl_1spp_4nf_8b.dng',        1, 4, '?'),  # OOB WRITE x4
+              ('corpus/tiff_jpegl_4spp_1nf_8b.dng',        4, 1, '?'),  # OOB READ x4
+          ]
+
+          print("=" * 80)
+          print(" Output JPEG analysis — channel count of sips-decoded output")
+          print(" SPP=TIFF outer (malloc size), Nf=JPEGL inner (loop count)")
+          print(f" {'File':<45} {'SPP':>3} {'Nf':>3} {'ch_out':>6}  verdict")
+          print("=" * 80)
+
+          for path, spp, nf, expected in cases:
+              if not os.path.exists(path):
+                  continue
+              fname = os.path.basename(path)
+              out = '/tmp/jpegl_decode_test.jpeg'
+              r = subprocess.run(
+                  ['sips', '-s', 'format', 'jpeg', path, '--out', out],
+                  capture_output=True, text=True, timeout=20
+              )
+              if r.returncode != 0:
+                  print(f"  {fname:<45} {spp:>3} {nf:>3}  rc={r.returncode:>3}  DECODE_ERR (codec path not reached)")
+                  continue
+              # Query the output JPEG
+              r2 = subprocess.run(
+                  ['sips', '-g', 'samplesPerPixel', '-g', 'pixelWidth', '-g', 'pixelHeight', out],
+                  capture_output=True, text=True, timeout=10
+              )
+              spp_out = None
+              w_out = None
+              for line in r2.stdout.splitlines():
+                  if 'samplesPerPixel:' in line:
+                      spp_out = line.split()[-1]
+                  if 'pixelWidth:' in line:
+                      w_out = line.split()[-1]
+              verdict = '?'
+              if spp_out is not None:
+                  ch = int(spp_out)
+                  if ch == nf and ch != spp:
+                      verdict = f'ch={ch} (used Nf, not SPP — buffer may have been OOB-written)'
+                  elif ch == spp:
+                      verdict = f'ch={ch} (used SPP — decoder truncated at outer SPP)'
+                  else:
+                      verdict = f'ch={ch} UNEXPECTED'
+              print(f"  {fname:<45} {spp:>3} {nf:>3}  ch={spp_out or '?':>3}  {verdict}")
           PYEOF
 
       - name: Collect macOS crash reports
