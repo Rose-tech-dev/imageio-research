@@ -331,50 +331,69 @@ def build_jpegls(width, height, nf, bits=8):
 
 def build_jpegl(width, height, nf, bits=16):
     """
-    Valid JPEG-Lossless (SOF3) stream for an all-zero image.
+    JPEG-Lossless (SOF3) stream encoding an all-midpoint image.
     nf: component count in SOF3 = INNER metadata (mismatch target).
 
-    Encoding: predictor Ra (Ss=1), all-zero image → every prediction error=0.
-    DHT: 1 code of 1 bit ('0') for category 0.
-    Scan data: (w*h*nf+7)//8 zero bytes — no 0xFF, no byte-stuffing needed.
+    Image: all samples = 2^(P-1) (midpoint of bit depth).
+    Predictor Ra (Ss=1): initial Px = 2^(P-1), so every prediction error = 0.
+    DHT: unary-code table covering ALL categories 0..(P-1) so decoders that
+         validate table completeness before entering the decode loop will accept it.
+    Scan data: (w*h*nf) zero bits packed into bytes (all errors = category 0 = '0').
     """
     nf = max(nf, 1)
     s = bytearray()
     s += b'\xFF\xD8'  # SOI
 
-    # SOF3
+    # SOF3 (JPEG-Lossless frame header)
     lsof = 8 + 3 * nf
     s += b'\xFF\xC3'
     s += struct.pack('>H', lsof)
     s += struct.pack('>B', bits)
     s += struct.pack('>H', height)
     s += struct.pack('>H', width)
-    s += struct.pack('>B', nf)  # Nf <-- INNER METADATA
+    s += struct.pack('>B', nf)       # Nf <-- INNER component count (mismatch target)
     for i in range(nf):
-        s += struct.pack('>B', i + 1)
-        s += b'\x11'
-        s += b'\x00'
+        s += struct.pack('>B', i + 1)  # Ci: component id
+        s += b'\x11'                   # H_i=1, V_i=1 (1×1 sampling)
+        s += b'\x00'                   # Tq=0 (unused for lossless)
 
-    # DHT: Tc=0, Th=0; BITS=[1,0,...,0]; HUFFVAL=[0]
-    dht_payload  = b'\x00'
-    dht_payload += b'\x01' + b'\x00' * 15
-    dht_payload += b'\x00'
+    # DHT: one DC table (Tc=0, Th=0) using a unary prefix code.
+    # Each category k is assigned a code of length (k+1):
+    #   cat 0 → 0           (1 bit)
+    #   cat 1 → 10          (2 bits)
+    #   cat 2 → 110         (3 bits)
+    #   ...
+    #   cat (P-1) → 1...10  (P bits)
+    # BITS counts must sum to exactly the number of entries.
+    # For P-bit precision: categories 0..(P-1).
+    n_cats = min(bits, 16)   # number of categories = bit depth (capped at 16)
+    # BITS[i] = number of codes of length (i+1)
+    # Using unary: one code per length 1..n_cats
+    bits_array = [0] * 16
+    for k in range(n_cats):
+        bits_array[k] = 1          # 1 code of length (k+1)
+    huffval = list(range(n_cats))  # HUFFVAL: categories 0..(n_cats-1)
+    dht_payload  = b'\x00'                        # Tc=0 (DC), Th=0
+    dht_payload += bytes(bits_array)              # BITS[0..15]
+    dht_payload += bytes(huffval)                 # HUFFVAL
     s += b'\xFF\xC4'
     s += struct.pack('>H', 2 + len(dht_payload))
     s += dht_payload
 
-    # SOS
+    # SOS (Start of Scan)
     lsos = 6 + 2 * nf
     s += b'\xFF\xDA'
     s += struct.pack('>H', lsos)
     s += struct.pack('>B', nf)
     for i in range(nf):
-        s += struct.pack('>B', i + 1)
-        s += b'\x00'
+        s += struct.pack('>B', i + 1)  # Cs: component selector
+        s += b'\x00'                   # Td=0 (DC table), Ta=0 (unused)
     s += b'\x01'  # Ss=1 (predictor Ra)
     s += b'\x00'  # Se=0
-    s += b'\x00'  # Ah=0, Al=0
+    s += b'\x00'  # Ah=0, Al=0 (no point transform)
 
+    # Scan data: encode w*h*nf prediction errors of 0 (category 0 = '0' bit each).
+    # Total bits = w*h*nf; round up to whole bytes; all zeros → no 0xFF stuffing needed.
     n_bits = width * height * nf
     s += bytes((n_bits + 7) // 8)
 
@@ -473,7 +492,8 @@ def build_dng(width=64, height=64, spp=3, inner_comps=1,
             write = alloc
             overflow = 0
 
-        photo_name = {PHOTO_CFA: 'CFA', PHOTO_LINEAR_RAW: 'LinearRaw'}.get(photometric, str(photometric))
+        photo_name = {PHOTO_CFA: 'CFA', PHOTO_LINEAR_RAW: 'LinearRaw',
+                      PHOTO_MINISBLACK: 'Gray', PHOTO_RGB: 'RGB'}.get(photometric, str(photometric))
         print(f'\n[+] {outfile}')
         print(f'    Codec:         {label}  Photo: {photo_name}')
         print(f'    Dimensions:    {width} x {height}   BitsPerSample: {bits}')
@@ -521,6 +541,15 @@ CORPUS = [
 
     # ---- J2K (likely unsupported but retained) ----
     (64,  64,  3, 1, 16, COMP_JPEG2000, 'j2k_lr_3spp_1csiz_16b',             PHOTO_LINEAR_RAW),
+
+    # ---- DNG + standard photometric (Gray / RGB) + JPEGL ----
+    # DIAGNOSTIC: does Camera Raw routing depend on CFA/LR photometric specifically?
+    # If [OK+RENDER] OK_MIDPOINT → TIFF plugin handles DNG+Gray/RGB (routing is photo-specific)
+    # If [NO_IMG]               → ANY DNG tag causes routing failure (photometric irrelevant)
+    (64,  64,  1, 1,  8, COMP_JPEG_LOSSLESS, 'CTRL_dng_gray_jpegl_1spp_1nf_8b', PHOTO_MINISBLACK),
+    (64,  64,  1, 3,  8, COMP_JPEG_LOSSLESS, 'diag_dng_gray_jpegl_1spp_3nf_8b', PHOTO_MINISBLACK),
+    (64,  64,  3, 3,  8, COMP_JPEG_LOSSLESS, 'CTRL_dng_rgb_jpegl_3spp_3nf_8b',  PHOTO_RGB),
+    (64,  64,  3, 1,  8, COMP_JPEG_LOSSLESS, 'diag_dng_rgb_jpegl_3spp_1nf_8b',  PHOTO_RGB),
 ]
 
 
