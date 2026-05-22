@@ -323,15 +323,16 @@ jobs:
 
       - name: DIAGNOSTIC - decode output analysis (detect silent OOB via channel count)
         if: always()
+        continue-on-error: true
         run: |
           python3 << 'PYEOF'
           import subprocess, os
 
           # For mismatch files that return rc=0 with jpeg output, check the OUTPUT JPEG.
           # If SPP=1 (1-channel buffer allocated) but Nf=3 (JPEGL writes 3 channels):
-          #   - output has 3 channels → decoder ignored SPP, used Nf (no OOB or silent OOB)
-          #   - output has 1 channel  → decoder correctly truncated at SPP=1
-          #   - output is invalid     → decoder corrupted the buffer
+          #   ch_out=3 → decoder trusted Nf, not SPP (OOB or graceful override)
+          #   ch_out=1 → decoder truncated at outer SPP=1 (safe)
+          #   ch_out=<nil> → sips can't read the output (grayscale or corrupt output)
           cases = [
               # (file, spp, nf, expected_channels_if_no_bug)
               ('corpus/DIAG_plain_tiff_rgb_8b.dng',       3, 3, 3),
@@ -343,11 +344,11 @@ jobs:
               ('corpus/tiff_jpegl_4spp_1nf_8b.dng',        4, 1, '?'),  # OOB READ x4
           ]
 
-          print("=" * 80)
+          print("=" * 90)
           print(" Output JPEG analysis — channel count of sips-decoded output")
           print(" SPP=TIFF outer (malloc size), Nf=JPEGL inner (loop count)")
           print(f" {'File':<45} {'SPP':>3} {'Nf':>3} {'ch_out':>6}  verdict")
-          print("=" * 80)
+          print("=" * 90)
 
           for path, spp, nf, expected in cases:
               if not os.path.exists(path):
@@ -359,9 +360,12 @@ jobs:
                   capture_output=True, text=True, timeout=20
               )
               if r.returncode != 0:
-                  print(f"  {fname:<45} {spp:>3} {nf:>3}  rc={r.returncode:>3}  DECODE_ERR (codec path not reached)")
+                  print(f"  {fname:<45} {spp:>3} {nf:>3}  rc={r.returncode:>3}  DECODE_ERR")
                   continue
-              # Query the output JPEG
+              # Verify output exists and read its metadata
+              if not os.path.exists(out):
+                  print(f"  {fname:<45} {spp:>3} {nf:>3}  ch=???  NO_OUTPUT_FILE")
+                  continue
               r2 = subprocess.run(
                   ['sips', '-g', 'samplesPerPixel', '-g', 'pixelWidth', '-g', 'pixelHeight', out],
                   capture_output=True, text=True, timeout=10
@@ -373,16 +377,30 @@ jobs:
                       spp_out = line.split()[-1]
                   if 'pixelWidth:' in line:
                       w_out = line.split()[-1]
+              # Also show raw file type
+              file_r = subprocess.run(['file', out], capture_output=True, text=True)
+              file_type = file_r.stdout.strip().split(': ', 1)[-1] if file_r.returncode == 0 else '?'
               verdict = '?'
-              if spp_out is not None:
-                  ch = int(spp_out)
-                  if ch == nf and ch != spp:
-                      verdict = f'ch={ch} (used Nf, not SPP — buffer may have been OOB-written)'
-                  elif ch == spp:
-                      verdict = f'ch={ch} (used SPP — decoder truncated at outer SPP)'
-                  else:
-                      verdict = f'ch={ch} UNEXPECTED'
-              print(f"  {fname:<45} {spp:>3} {nf:>3}  ch={spp_out or '?':>3}  {verdict}")
+              if spp_out is None:
+                  verdict = 'sips returned no samplesPerPixel'
+              elif spp_out == '<nil>':
+                  # sips returns <nil> for 1-component (grayscale) JPEG — treat as ch=1
+                  verdict = 'ch=<nil> → grayscale output (1-channel) — decoder used SPP=1, NOT Nf'
+                  if nf != spp:
+                      verdict += f'  *** SAFE: truncated at SPP={spp}, Nf={nf} ignored'
+              else:
+                  try:
+                      ch = int(spp_out)
+                      if ch == nf and ch != spp:
+                          verdict = f'ch={ch} *** USED Nf NOT SPP — possible OOB write (SPP={spp} buffer, Nf={nf} writes)'
+                      elif ch == spp:
+                          verdict = f'ch={ch} — decoder truncated at outer SPP={spp} (safe)'
+                      else:
+                          verdict = f'ch={ch} UNEXPECTED (neither SPP={spp} nor Nf={nf})'
+                  except ValueError:
+                      verdict = f'ch={spp_out!r} PARSE_ERROR'
+              print(f"  {fname:<45} {spp:>3} {nf:>3}  ch={spp_out or '?':>5}  {verdict}")
+              print(f"    file: {file_type}  w={w_out}")
           PYEOF
 
       - name: Collect macOS crash reports
