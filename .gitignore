@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+*.pyo
+test_uncompressed.tiff
+crash_report.json

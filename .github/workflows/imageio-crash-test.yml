@@ -1,0 +1,173 @@
+name: ImageIO Crash Test (macOS)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:   # manual trigger from GitHub Actions UI
+
+jobs:
+  crash-test:
+    runs-on: macos-latest     # full Apple ImageIO + sips available
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Generate corpus
+        run: |
+          python dng_fuzzer.py --corpus
+          echo "Generated corpus files:"
+          ls -lah corpus/
+
+      - name: System info
+        run: |
+          sw_vers
+          sips --version 2>/dev/null || echo "sips: $(which sips)"
+          python --version
+
+      - name: Run crash test against each corpus file
+        id: crash_test
+        run: |
+          python << 'PYEOF'
+          import subprocess, os, sys, json, time
+
+          corpus_dir = 'corpus'
+          results = []
+
+          files = sorted(f for f in os.listdir(corpus_dir) if f.endswith('.dng'))
+          print(f"Testing {len(files)} files with sips...\n")
+
+          for fname in files:
+              path = os.path.join(corpus_dir, fname)
+              t0 = time.time()
+              try:
+                  r = subprocess.run(
+                      ['sips', '-g', 'all', path],
+                      capture_output=True, text=True, timeout=15
+                  )
+                  elapsed = time.time() - t0
+                  status = 'CRASH' if r.returncode != 0 else 'OK'
+                  result = {
+                      'file': fname,
+                      'status': status,
+                      'rc': r.returncode,
+                      'elapsed': round(elapsed, 2),
+                      'stdout': r.stdout[:500],
+                      'stderr': r.stderr[:300],
+                  }
+              except subprocess.TimeoutExpired:
+                  elapsed = time.time() - t0
+                  result = {
+                      'file': fname,
+                      'status': 'HANG',
+                      'rc': -1,
+                      'elapsed': round(elapsed, 2),
+                      'stdout': '',
+                      'stderr': 'TIMEOUT',
+                  }
+
+              results.append(result)
+
+              icon = {'OK': '  [ok]', 'CRASH': '[CRASH]', 'HANG': '[ HANG]'}[result['status']]
+              print(f"{icon} {fname}  rc={result['rc']}  {elapsed:.2f}s")
+              if result['stderr']:
+                  print(f"        stderr: {result['stderr'][:100]}")
+              if result['status'] != 'OK':
+                  print(f"        stdout: {result['stdout'][:200]}")
+
+          # Summary
+          crashes = [r for r in results if r['status'] == 'CRASH']
+          hangs   = [r for r in results if r['status'] == 'HANG']
+          ok      = [r for r in results if r['status'] == 'OK']
+
+          print(f"\n{'='*60}")
+          print(f"RESULTS: ok={len(ok)}  crash={len(crashes)}  hang={len(hangs)}")
+          print(f"{'='*60}\n")
+
+          if crashes:
+              print("CRASH FINDINGS:")
+              for r in crashes:
+                  print(f"  {r['file']}  rc={r['rc']}")
+                  print(f"    {r['stderr']}")
+
+          if hangs:
+              print("\nHANG FINDINGS:")
+              for r in hangs:
+                  print(f"  {r['file']}")
+
+          # Write JSON report for artifact upload
+          with open('crash_report.json', 'w') as f:
+              json.dump(results, f, indent=2)
+
+          # Set outputs for subsequent steps
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"crash_count={len(crashes)}\n")
+              f.write(f"hang_count={len(hangs)}\n")
+
+          # Exit 1 if any crashes found (marks the action as failed/notable)
+          if crashes or hangs:
+              sys.exit(1)
+          PYEOF
+
+      - name: Collect crash reports from macOS
+        if: always()
+        run: |
+          echo "=== System crash reports (sips / RawCamera) ==="
+          CRASH_DIR="$HOME/Library/Logs/DiagnosticReports"
+          ls "$CRASH_DIR" 2>/dev/null | grep -iE "sips|rawcamera|imagei" || echo "No matching crash reports"
+          for f in "$CRASH_DIR"/*sips*.ips "$CRASH_DIR"/*RawCamera*.ips 2>/dev/null; do
+            [ -f "$f" ] && echo "=== $f ===" && head -60 "$f"
+          done || true
+
+      - name: Check AddressSanitizer output (if available)
+        if: always()
+        run: |
+          # Re-run the highest-priority file with ASAN_OPTIONS for better crash detail
+          for f in corpus/j2k_3spp_1csiz_16b_512.dng corpus/j2k_4spp_1csiz_16b.dng; do
+            [ -f "$f" ] || continue
+            echo "=== ASAN run: $f ==="
+            ASAN_OPTIONS=detect_oob_reads=1 \
+            MallocScribble=1 \
+            MallocGuardEdges=1 \
+            sips -g all "$f" 2>&1 | head -30 || true
+          done
+
+      - name: Upload crash artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crash-results
+          path: |
+            crash_report.json
+            corpus/
+            ~/Library/Logs/DiagnosticReports/*sips*.ips
+            ~/Library/Logs/DiagnosticReports/*RawCamera*.ips
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Print final verdict
+        if: always()
+        run: |
+          echo ""
+          echo "===================================="
+          echo " CRASH COUNT: ${{ steps.crash_test.outputs.crash_count || 0 }}"
+          echo " HANG  COUNT: ${{ steps.crash_test.outputs.hang_count  || 0 }}"
+          echo "===================================="
+          cat crash_report.json 2>/dev/null | python3 -c "
+          import json,sys
+          d=json.load(sys.stdin)
+          crashes=[r for r in d if r['status']!='OK']
+          if crashes:
+              print('POTENTIAL FINDINGS:')
+              for r in crashes:
+                  print(f'  [{r[\"status\"]}] {r[\"file\"]}  rc={r[\"rc\"]}')
+                  print(f'    {r[\"stderr\"][:120]}')
+          else:
+              print('No crashes or hangs detected.')
+          " || true
