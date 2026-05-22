@@ -186,45 +186,177 @@ jobs:
               print(row)
           PYEOF
 
-      - name: DIAGNOSTIC - qlmanage (QuickLook, 8s timeout via Python)
+      - name: DIAGNOSTIC - qlmanage (QuickLook, 8s timeout + crash report monitoring)
         if: always()
         run: |
           mkdir -p /tmp/ql_out
           python3 << 'PYEOF'
-          import subprocess, os
+          import subprocess, os, glob, time
 
-          print("=" * 62)
-          print(" qlmanage -t (QuickLook — separate from sips/ImageIO path)")
-          print(" OK      → plugin rendered successfully")
-          print(" TIMEOUT → plugin hung (potential infinite loop bug)")
-          print(" ERR     → plugin rejected the file")
-          print("=" * 62)
+          CRASH_DIR = os.path.expanduser("~/Library/Logs/DiagnosticReports")
 
-          import glob
-          # Test all corpus files — hang map tells us which files are DoS vectors
+          def snapshot():
+              try:
+                  return set(os.listdir(CRASH_DIR))
+              except FileNotFoundError:
+                  return set()
+
+          def read_report(path):
+              try:
+                  with open(path, errors='replace') as f:
+                      return f.read(4000)
+              except Exception as e:
+                  return f'(could not read: {e})'
+
+          # Files where SPP != Nf — these are OOB write/read candidates
+          MISMATCH_NAMES = {
+              'tiff_jpegl_1spp_3nf_8b.dng',       # SPP=1, Nf=3  OOB WRITE
+              'tiff_jpegl_3spp_1nf_8b.dng',       # SPP=3, Nf=1  OOB READ
+              'tiff_jpegl_1spp_4nf_8b.dng',       # SPP=1, Nf=4  OOB WRITE x4
+              'tiff_jpegl_4spp_1nf_8b.dng',       # SPP=4, Nf=1  OOB READ x4
+              'diag_dng_gray_jpegl_1spp_3nf_8b.dng',  # DNG gray mismatch
+              'diag_dng_rgb_jpegl_3spp_1nf_8b.dng',   # DNG rgb mismatch
+          }
+
+          print("=" * 70)
+          print(" qlmanage -t  (QuickLook — DIFFERENT JPEGL decoder than sips/CGImageSource)")
+          print(" Monitors ~/Library/Logs/DiagnosticReports for crash reports after each render.")
+          print(" [QL-OK]      = QuickLook rendered successfully")
+          print(" [QL-TIMEOUT] = hung >8s (DoS / infinite-loop bug)")
+          print(" [QL-ERR]     = plugin rejected the file")
+          print(" *** CRASH    = new DiagnosticReport generated during render")
+          print("=" * 70)
+          print()
+
           all_files = sorted(glob.glob('corpus/*.dng'))
-          # Priority order: CTRL first, then mismatch targets, then bulk
           priority = [f for f in all_files if 'CTRL' in f or 'DIAG' in f]
           rest     = [f for f in all_files if f not in priority]
-          files = priority + rest
+          files    = priority + rest
+
+          crash_reports_found = []
 
           for f in files:
               if not os.path.exists(f):
                   continue
               fname = os.path.basename(f)
+              is_mismatch = fname in MISMATCH_NAMES
+
+              before = snapshot()
+              t0 = time.time()
               try:
                   r = subprocess.run(
                       ['qlmanage', '-t', '-s', '64', '-o', '/tmp/ql_out', f],
-                      capture_output=True, text=True, timeout=8
+                      capture_output=True, text=True, timeout=8,
+                      env={**os.environ,
+                           'MallocScribble': '1',
+                           'MallocGuardEdges': '1'},
                   )
+                  elapsed = time.time() - t0
                   if r.returncode == 0:
-                      print(f'  [QL-OK]      {fname}')
+                      tag = '  *** OOB TARGET' if is_mismatch else ''
+                      print(f'  [QL-OK]      {fname}{tag}  ({elapsed:.1f}s)')
                   else:
-                      print(f'  [QL-ERR rc={r.returncode}] {fname}')
-                      if r.stderr:
-                          print(f'    {r.stderr[:100]}')
+                      print(f'  [QL-ERR rc={r.returncode}] {fname}  ({elapsed:.1f}s)')
+                      if r.stderr.strip():
+                          print(f'    stderr: {r.stderr.strip()[:120]}')
               except subprocess.TimeoutExpired:
-                  print(f'  [QL-TIMEOUT] {fname}  <- potential infinite loop')
+                  elapsed = time.time() - t0
+                  print(f'  [QL-TIMEOUT] {fname}  ({elapsed:.1f}s)  <- DoS / infinite loop')
+                  continue
+
+              # Check for new crash reports immediately after render completes
+              time.sleep(0.3)   # brief pause for crash writer to flush
+              new = snapshot() - before
+              ql_new = {n for n in new if 'qlmanage' in n.lower() or
+                        'quicklook' in n.lower() or 'rawcamera' in n.lower() or
+                        'imagei' in n.lower()}
+              all_new = new  # also show unrelated new reports
+              if new:
+                  print(f'  *** NEW CRASH REPORTS ({len(new)}) after {fname}:')
+                  for report in sorted(new):
+                      rpath = os.path.join(CRASH_DIR, report)
+                      print(f'  === {report} ===')
+                      print(read_report(rpath))
+                      crash_reports_found.append(report)
+              elif is_mismatch and r.returncode == 0:
+                  # QL-OK but no crash — OOB may be silent or heap-layout-dependent
+                  print(f'    no crash report — OOB may be silent (heap layout dependent)')
+
+          print()
+          print("=" * 70)
+          if crash_reports_found:
+              print(f'CRASH REPORTS TRIGGERED ({len(crash_reports_found)}):')
+              for r in crash_reports_found:
+                  print(f'  {r}')
+          else:
+              print('No new crash reports generated during any qlmanage render.')
+              print('If OOB writes occurred they were silent (no guard page hit).')
+              print('Next step: run with libgmalloc or AddressSanitizer build.')
+          print("=" * 70)
+          PYEOF
+
+      - name: STRESS - qlmanage mismatch targets repeated (catch non-deterministic crash)
+        if: always()
+        continue-on-error: true
+        run: |
+          mkdir -p /tmp/ql_stress
+          python3 << 'PYEOF'
+          import subprocess, os, glob, time
+
+          CRASH_DIR = os.path.expanduser("~/Library/Logs/DiagnosticReports")
+
+          def snapshot():
+              try:
+                  return set(os.listdir(CRASH_DIR))
+              except FileNotFoundError:
+                  return set()
+
+          # Only the OOB write/read targets — run each 5 times
+          TARGETS = [
+              'corpus/tiff_jpegl_1spp_3nf_8b.dng',       # SPP=1, Nf=3  OOB WRITE
+              'corpus/tiff_jpegl_3spp_1nf_8b.dng',       # SPP=3, Nf=1  OOB READ
+              'corpus/tiff_jpegl_1spp_4nf_8b.dng',       # SPP=1, Nf=4  OOB WRITE x4
+              'corpus/tiff_jpegl_4spp_1nf_8b.dng',       # SPP=4, Nf=1  OOB READ x4
+              'corpus/diag_dng_gray_jpegl_1spp_3nf_8b.dng',
+              'corpus/diag_dng_rgb_jpegl_3spp_1nf_8b.dng',
+          ]
+          REPS = 5
+
+          print("=" * 70)
+          print(f" Stress: run each OOB target {REPS}x through qlmanage")
+          print(" Goal: catch non-deterministic heap-layout-dependent OOB crash")
+          print("=" * 70)
+
+          baseline = snapshot()
+          any_crash = False
+
+          for path in TARGETS:
+              if not os.path.exists(path):
+                  continue
+              fname = os.path.basename(path)
+              print(f'\n  {fname}:')
+              for i in range(REPS):
+                  before = snapshot()
+                  try:
+                      r = subprocess.run(
+                          ['qlmanage', '-t', '-s', '128', '-o', '/tmp/ql_stress', path],
+                          capture_output=True, text=True, timeout=8,
+                          env={**os.environ, 'MallocScribble': '1', 'MallocGuardEdges': '1'},
+                      )
+                      time.sleep(0.2)
+                      new = snapshot() - before
+                      if new:
+                          print(f'    rep {i+1}: QL-OK  *** CRASH REPORT: {new}')
+                          any_crash = True
+                      else:
+                          print(f'    rep {i+1}: QL-OK  no crash')
+                  except subprocess.TimeoutExpired:
+                      print(f'    rep {i+1}: TIMEOUT')
+
+          final_new = snapshot() - baseline
+          print(f'\nTotal new crash reports across entire stress run: {len(final_new)}')
+          for r in sorted(final_new):
+              print(f'  {r}')
           PYEOF
 
       - name: Run crash test (forced pixel decode via sips -s format png)
@@ -457,11 +589,23 @@ jobs:
       - name: Collect macOS crash reports
         if: always()
         run: |
-          echo "=== System crash reports (sips / RawCamera / ImageIO) ==="
+          echo "=== All crash reports (sips / qlmanage / RawCamera / ImageIO) ==="
           CRASH_DIR="$HOME/Library/Logs/DiagnosticReports"
-          ls "$CRASH_DIR" 2>/dev/null | grep -iE "sips|rawcamera|imagei|imageio" || echo "No matching crash reports"
-          find "$CRASH_DIR" -maxdepth 1 \( -name "*sips*.ips" -o -name "*RawCamera*.ips" \) 2>/dev/null | while read f; do
-            echo "=== $f ===" && head -80 "$f"
+          echo "--- Directory listing (all) ---"
+          ls "$CRASH_DIR" 2>/dev/null || echo "(empty or missing)"
+          echo ""
+          echo "--- Matching reports (sips|qlmanage|quicklook|rawcamera|imagei) ---"
+          ls "$CRASH_DIR" 2>/dev/null | grep -iE "sips|qlmanage|quicklook|rawcamera|imagei|imageio" || echo "No matching crash reports"
+          find "$CRASH_DIR" -maxdepth 1 \( \
+            -name "*sips*.ips"      -o -name "*sips*.crash"     \
+            -o -name "*qlmanage*.ips"  -o -name "*qlmanage*.crash" \
+            -o -name "*QuickLook*.ips" -o -name "*QuickLook*.crash" \
+            -o -name "*RawCamera*.ips" -o -name "*RawCamera*.crash" \
+            -o -name "*ImageIO*.ips"   -o -name "*ImageIO*.crash"   \
+          \) 2>/dev/null | while read f; do
+            echo ""
+            echo "=== $f ==="
+            head -100 "$f"
           done || true
 
       - name: Upload artifacts
@@ -473,7 +617,13 @@ jobs:
             crash_report.json
             corpus/
             ~/Library/Logs/DiagnosticReports/*sips*.ips
+            ~/Library/Logs/DiagnosticReports/*sips*.crash
+            ~/Library/Logs/DiagnosticReports/*qlmanage*.ips
+            ~/Library/Logs/DiagnosticReports/*qlmanage*.crash
+            ~/Library/Logs/DiagnosticReports/*QuickLook*.ips
+            ~/Library/Logs/DiagnosticReports/*QuickLook*.crash
             ~/Library/Logs/DiagnosticReports/*RawCamera*.ips
+            ~/Library/Logs/DiagnosticReports/*RawCamera*.crash
           if-no-files-found: ignore
           retention-days: 30
 
