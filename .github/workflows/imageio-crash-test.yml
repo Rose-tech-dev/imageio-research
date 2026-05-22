@@ -56,35 +56,46 @@ jobs:
             fi
           done
 
-      - name: DIAGNOSTIC - qlmanage (QuickLook / ImageIO pipeline, 8s timeout each)
+      - name: DIAGNOSTIC - qlmanage (QuickLook, 8s timeout via Python)
         if: always()
         run: |
-          echo ""
-          echo "======================================================"
-          echo " qlmanage -t (thumbnail — different path than sips, 8s max each)"
-          echo " OK → DNG/TIFF plugin rendered successfully"
-          echo " TIMEOUT → plugin hung (possibly infinite loop bug)"
-          echo " ERR → plugin rejected the file"
-          echo "======================================================"
           mkdir -p /tmp/ql_out
-          for f in corpus/DIAG_plain_tiff_rgb_8b.dng \
-                   corpus/CTRL_tiff_jpegl_3spp_3nf_16b.dng \
-                   corpus/tiff_jpegl_3spp_1nf_16b.dng \
-                   corpus/DIAG_dng_cfa_uncompressed.dng \
-                   corpus/CTRL_cfa_jpegl_1spp_1nf_16b.dng; do
-            [ -f "$f" ] || continue
-            fname=$(basename "$f")
-            out=$(timeout 8 qlmanage -t -s 64 -o /tmp/ql_out "$f" 2>&1)
-            rc=$?
-            if [ $rc -eq 0 ]; then
-              echo "  [QL-OK]      $fname"
-            elif [ $rc -eq 124 ]; then
-              echo "  [QL-TIMEOUT] $fname  ← potential infinite loop"
-            else
-              echo "  [QL-ERR rc=$rc] $fname"
-              echo "$out" | head -2 | sed 's/^/    /'
-            fi
-          done
+          python3 << 'PYEOF'
+          import subprocess, os
+
+          print("=" * 62)
+          print(" qlmanage -t (QuickLook — separate from sips/ImageIO path)")
+          print(" OK      → plugin rendered successfully")
+          print(" TIMEOUT → plugin hung (potential infinite loop bug)")
+          print(" ERR     → plugin rejected the file")
+          print("=" * 62)
+
+          files = [
+              'corpus/DIAG_plain_tiff_rgb_8b.dng',
+              'corpus/CTRL_tiff_jpegl_3spp_3nf_16b.dng',
+              'corpus/tiff_jpegl_3spp_1nf_16b.dng',
+              'corpus/DIAG_dng_cfa_uncompressed.dng',
+              'corpus/CTRL_cfa_jpegl_1spp_1nf_16b.dng',
+          ]
+
+          for f in files:
+              if not os.path.exists(f):
+                  continue
+              fname = os.path.basename(f)
+              try:
+                  r = subprocess.run(
+                      ['qlmanage', '-t', '-s', '64', '-o', '/tmp/ql_out', f],
+                      capture_output=True, text=True, timeout=8
+                  )
+                  if r.returncode == 0:
+                      print(f'  [QL-OK]      {fname}')
+                  else:
+                      print(f'  [QL-ERR rc={r.returncode}] {fname}')
+                      if r.stderr:
+                          print(f'    {r.stderr[:100]}')
+              except subprocess.TimeoutExpired:
+                  print(f'  [QL-TIMEOUT] {fname}  <- potential infinite loop')
+          PYEOF
 
       - name: Run crash test (forced pixel decode via sips -s format png)
         id: crash_test
