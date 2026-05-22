@@ -359,15 +359,10 @@ jobs:
         if: always()
         run: |
           mkdir -p /tmp/ql_out
-          # Baseline: show what qlmanage creates for a known-good PNG (confirms thumbnail naming)
-          echo "--- qlmanage baseline on known-good PNG ---"
-          python3 -c "
-from PIL import Image
-img = Image.new('RGB', (64,64), (128,0,128))
-img.save('/tmp/known_good.png')
-" 2>/dev/null || convert -size 64x64 xc:purple /tmp/known_good.png 2>/dev/null || true
-          qlmanage -t -s 64 -o /tmp/ql_out /tmp/known_good.png 2>&1 || true
-          echo "--- /tmp/ql_out contents after known-good PNG ---"
+          # Baseline: show what qlmanage creates for a known-good TIFF (confirms thumbnail naming)
+          echo "--- qlmanage baseline on DIAG_plain_tiff_rgb_8b.dng ---"
+          qlmanage -t -s 64 -o /tmp/ql_out corpus/DIAG_plain_tiff_rgb_8b.dng 2>&1 || true
+          echo "--- /tmp/ql_out contents after known-good TIFF ---"
           ls -la /tmp/ql_out/ 2>/dev/null || echo "(empty)"
           rm -f /tmp/ql_out/*.png  # clean for JPEGL tests
           echo "---"
