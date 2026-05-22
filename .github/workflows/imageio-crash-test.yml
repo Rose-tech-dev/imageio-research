@@ -495,6 +495,93 @@ jobs:
           echo "--- /tmp/ql_out contents (all qlmanage thumbnail outputs) ---"
           ls -la /tmp/ql_out/ 2>/dev/null | head -40 || echo "(empty)"
 
+      - name: REAL-CAM - qlmanage with real camera model DNG (Canon/Nikon, 60s timeout)
+        if: always()
+        continue-on-error: true
+        run: |
+          mkdir -p /tmp/ql_camraw
+          python3 << 'PYEOF'
+          import subprocess, os, time
+
+          CRASH_DIR = os.path.expanduser("~/Library/Logs/DiagnosticReports")
+
+          def snapshot():
+              try:
+                  return set(os.listdir(CRASH_DIR))
+              except FileNotFoundError:
+                  return set()
+
+          def read_crash(path):
+              try:
+                  with open(path, errors='replace') as f:
+                      return f.read(4000)
+              except Exception as e:
+                  return f'(unreadable: {e})'
+
+          TARGETS = [
+              # (file, label)
+              ('corpus/camraw_canon_cfa_uncomp_ctrl.dng',   'Canon R5 CFA uncompressed CTRL'),
+              ('corpus/camraw_nikon_cfa_uncomp_ctrl.dng',   'Nikon Z9 CFA uncompressed CTRL'),
+              ('corpus/camraw_canon_cfa_jpegl_ctrl.dng',    'Canon R5 CFA JPEGL CTRL (SPP=Nf=1)'),
+              ('corpus/camraw_canon_cfa_jpegl_1spp_3nf.dng','Canon R5 CFA JPEGL MISMATCH SPP=1 Nf=3'),
+              ('corpus/camraw_canon_cfa_jpegl_1spp_4nf.dng','Canon R5 CFA JPEGL MISMATCH SPP=1 Nf=4'),
+              ('corpus/camraw_canon_lr_jpegl_3spp_1nf.dng', 'Canon R5 LR  JPEGL MISMATCH SPP=3 Nf=1'),
+          ]
+
+          print("=" * 80)
+          print(" Real camera model DNG + Camera Raw — 60s timeout")
+          print(" Hypothesis: Camera Raw hangs on FuzzResearch/ because model is unknown.")
+          print("   Using Canon EOS R5 / Nikon Z9 to use bundled calibration data.")
+          print(" If CTRL completes quickly → Camera Raw hang WAS due to unknown model.")
+          print(" Then mismatch files may CRASH rather than hang.")
+          print("=" * 80)
+
+          baseline = snapshot()
+
+          for path, label in TARGETS:
+              if not os.path.exists(path):
+                  print(f'  [MISSING] {label}')
+                  continue
+              fname = os.path.basename(path)
+              before = snapshot()
+              t0 = time.time()
+              try:
+                  r = subprocess.run(
+                      ['qlmanage', '-t', '-s', '64', '-o', '/tmp/ql_camraw', path],
+                      capture_output=True, text=True, timeout=60,
+                      env={**os.environ, 'MallocScribble': '1', 'MallocGuardEdges': '1'},
+                  )
+                  elapsed = time.time() - t0
+                  time.sleep(0.5)
+                  new = snapshot() - before
+                  if new:
+                      print(f'  [QL-OK CRASH ***] {fname}  {elapsed:.1f}s  *** CRASH REPORT:')
+                      for report in sorted(new):
+                          rp = os.path.join(CRASH_DIR, report)
+                          print(f'  === {report} ===')
+                          print(read_crash(rp))
+                  elif r.returncode == 0:
+                      print(f'  [QL-OK]           {fname}  {elapsed:.1f}s  {label}')
+                  else:
+                      print(f'  [QL-ERR rc={r.returncode}] {fname}  {elapsed:.1f}s')
+                      if r.stderr.strip():
+                          print(f'    {r.stderr.strip()[:100]}')
+              except subprocess.TimeoutExpired:
+                  elapsed = time.time() - t0
+                  print(f'  [QL-TIMEOUT 60s]  {fname}  ({elapsed:.0f}s)  {label}')
+
+          # List what was created
+          print('\n--- /tmp/ql_camraw contents ---')
+          for f in sorted(os.listdir('/tmp/ql_camraw')):
+              sz = os.path.getsize(f'/tmp/ql_camraw/{f}')
+              print(f'  {f}  {sz}B')
+
+          final_new = snapshot() - baseline
+          print(f'\nTotal new crash reports: {len(final_new)}')
+          for r in sorted(final_new):
+              print(f'  {r}')
+          PYEOF
+
       - name: STRESS - qlmanage extreme Nf targets (multi-MB OOB → page fault)
         if: always()
         continue-on-error: true
