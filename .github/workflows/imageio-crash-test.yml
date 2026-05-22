@@ -32,6 +32,48 @@ jobs:
           echo "Generated corpus files:"
           ls -lah corpus/
 
+      - name: DIAGNOSTIC - file type and Swift CGImageSource (direct ImageIO)
+        if: always()
+        run: |
+          echo "======================================================"
+          echo " file(1) magic-byte type detection"
+          echo "======================================================"
+          file corpus/*.dng | sed 's|corpus/||'
+
+          echo ""
+          echo "======================================================"
+          echo " Swift CGImageSource: direct ImageIO pipeline (no sips)"
+          echo " uti=com.adobe.raw-image → DNG Camera Raw plugin used"
+          echo " uti=public.tiff         → generic TIFF plugin (bug)"
+          echo " NO_IMG → plugin loaded but pixel decode failed"
+          echo " NO_SRC → ImageIO refused to open the file entirely"
+          echo "======================================================"
+          cat > /tmp/iosrc.swift << 'SWEOF'
+import Foundation
+import CoreGraphics
+
+let dir = "corpus"
+guard let entries = try? FileManager.default.contentsOfDirectory(atPath: dir) else {
+    print("Cannot read corpus dir"); exit(1)
+}
+let files = entries.filter { $0.hasSuffix(".dng") }.sorted()
+
+for fname in files {
+    let url = URL(fileURLWithPath: "\(dir)/\(fname)") as CFURL
+    guard let src = CGImageSourceCreateWithURL(url, nil) else {
+        print("  [NO_SRC ] \(fname)")
+        continue
+    }
+    let uti = (CGImageSourceGetType(src) as String?) ?? "nil"
+    guard let img = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
+        print("  [NO_IMG ] \(fname)  uti=\(uti)")
+        continue
+    }
+    print("  [OK     ] \(fname)  uti=\(uti)  \(img.width)x\(img.height)px")
+}
+SWEOF
+          swift /tmp/iosrc.swift
+
       - name: DIAGNOSTIC - sips metadata read (sips -g all)
         id: diag_metadata
         if: always()
@@ -56,6 +98,53 @@ jobs:
             fi
           done
 
+      - name: DIAGNOSTIC - sips output format matrix (which format lets decoder run?)
+        if: always()
+        run: |
+          python3 << 'PYEOF'
+          import subprocess, os
+
+          # If CTRL returns rc=0 for any format, the decoder IS running cleanly.
+          # If CTRL still returns rc=13 for all formats, the bitstream itself is rejected.
+          # A crash (rc=139/6) on mismatch cases but not CTRL confirms OOB bug.
+          test_files = [
+              'corpus/DIAG_plain_tiff_rgb_8b.dng',
+              'corpus/CTRL_tiff_jpegl_3spp_3nf_8b.dng',
+              'corpus/CTRL_tiff_jpegl_1spp_1nf_8b.dng',
+              'corpus/tiff_jpegl_1spp_3nf_8b.dng',
+              'corpus/tiff_jpegl_3spp_1nf_8b.dng',
+              'corpus/DIAG_dng_cfa_uncompressed.dng',
+              'corpus/CTRL_cfa_jpegl_1spp_1nf_16b.dng',
+              'corpus/cfa_jpegl_1spp_3nf_16b.dng',
+              'corpus/CTRL_lr_jpegl_3spp_3nf_16b.dng',
+              'corpus/lr_jpegl_3spp_1nf_16b.dng',
+          ]
+          formats = ['bmp', 'tiff', 'jpeg', 'png']
+
+          hdr = f"  {'File':<50}" + "".join(f"  {f:>4}" for f in formats)
+          print("=" * len(hdr))
+          print(" sips rc per output format  (0=OK  13=err  -1=hang)")
+          print(hdr)
+          print("=" * len(hdr))
+
+          for path in test_files:
+              if not os.path.exists(path):
+                  continue
+              fname = os.path.basename(path)
+              row = f"  {fname:<50}"
+              for fmt in formats:
+                  out = f'/tmp/sips_{fmt}.{fmt}'
+                  try:
+                      r = subprocess.run(
+                          ['sips', '-s', 'format', fmt, path, '--out', out],
+                          capture_output=True, text=True, timeout=20
+                      )
+                      row += f"  {r.returncode:>4}"
+                  except subprocess.TimeoutExpired:
+                      row += "  HANG"
+              print(row)
+          PYEOF
+
       - name: DIAGNOSTIC - qlmanage (QuickLook, 8s timeout via Python)
         if: always()
         run: |
@@ -70,13 +159,13 @@ jobs:
           print(" ERR     → plugin rejected the file")
           print("=" * 62)
 
-          files = [
-              'corpus/DIAG_plain_tiff_rgb_8b.dng',
-              'corpus/CTRL_tiff_jpegl_3spp_3nf_16b.dng',
-              'corpus/tiff_jpegl_3spp_1nf_16b.dng',
-              'corpus/DIAG_dng_cfa_uncompressed.dng',
-              'corpus/CTRL_cfa_jpegl_1spp_1nf_16b.dng',
-          ]
+          import glob
+          # Test all corpus files — hang map tells us which files are DoS vectors
+          all_files = sorted(glob.glob('corpus/*.dng'))
+          # Priority order: CTRL first, then mismatch targets, then bulk
+          priority = [f for f in all_files if 'CTRL' in f or 'DIAG' in f]
+          rest     = [f for f in all_files if f not in priority]
+          files = priority + rest
 
           for f in files:
               if not os.path.exists(f):
