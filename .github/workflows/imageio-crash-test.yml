@@ -3,12 +3,12 @@ name: ImageIO Crash Test (macOS)
 on:
   push:
     branches: [ main ]
-  workflow_dispatch:   # manual trigger from GitHub Actions UI
+  workflow_dispatch:
 
 jobs:
   crash-test:
-    runs-on: macos-latest     # full Apple ImageIO + sips available
-    timeout-minutes: 15
+    runs-on: macos-latest
+    timeout-minutes: 20
 
     steps:
       - name: Checkout
@@ -19,19 +19,58 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Generate corpus
-        run: |
-          python dng_fuzzer.py --corpus
-          echo "Generated corpus files:"
-          ls -lah corpus/
-
       - name: System info
         run: |
           sw_vers
           sips --version 2>/dev/null || echo "sips: $(which sips)"
           python --version
 
-      - name: Run crash test against each corpus file
+      - name: Generate corpus
+        run: |
+          python dng_fuzzer.py --corpus
+          echo ""
+          echo "Generated corpus files:"
+          ls -lah corpus/
+
+      - name: DIAGNOSTIC - sips metadata read (sips -g all)
+        id: diag_metadata
+        if: always()
+        run: |
+          echo "======================================================"
+          echo " PHASE 1: sips -g all (metadata read, no pixel decode)"
+          echo " rc=0 → file recognized as image format"
+          echo " rc!=0 → format recognition fails (structural TIFF bug)"
+          echo "======================================================"
+          for f in corpus/*.dng; do
+            fname=$(basename "$f")
+            out=$(sips -g format -g pixelWidth -g pixelHeight "$f" 2>&1)
+            rc=$?
+            if [ $rc -eq 0 ]; then
+              fmt=$(echo "$out" | grep 'format:' | awk '{print $2}')
+              w=$(echo "$out" | grep 'pixelWidth:' | awk '{print $2}')
+              h=$(echo "$out" | grep 'pixelHeight:' | awk '{print $2}')
+              echo "  [META-OK]  $fname  format=$fmt  ${w}x${h}"
+            else
+              echo "  [META-ERR rc=$rc] $fname"
+              echo "    $out" | head -3
+            fi
+          done
+
+      - name: DIAGNOSTIC - mdls (macOS file type detection)
+        if: always()
+        run: |
+          echo ""
+          echo "======================================================"
+          echo " macOS UTI (file type) for each corpus file"
+          echo "======================================================"
+          for f in corpus/DIAG_*.dng corpus/CTRL_cfa_jpegl_1spp_1nf_16b.dng; do
+            [ -f "$f" ] || continue
+            fname=$(basename "$f")
+            uti=$(mdls -name kMDItemContentType "$f" 2>/dev/null | awk -F'"' '{print $2}')
+            echo "  $fname → UTI: $uti"
+          done
+
+      - name: Run crash test (forced pixel decode via sips -s format png)
         id: crash_test
         run: |
           python << 'PYEOF'
@@ -41,7 +80,9 @@ jobs:
           results = []
 
           files = sorted(f for f in os.listdir(corpus_dir) if f.endswith('.dng'))
-          print(f"Testing {len(files)} files with sips (forced pixel decode)...\n")
+          print(f"Testing {len(files)} files with sips (forced pixel decode to PNG)...\n")
+          print(f"{'File':<55} {'Status':>8}  {'RC':>5}  {'Time':>6}")
+          print("-" * 80)
 
           out_png = '/tmp/sips_out.png'
 
@@ -49,7 +90,6 @@ jobs:
               path = os.path.join(corpus_dir, fname)
               t0 = time.time()
               try:
-                  # Force full pixel decode by exporting to PNG — this invokes the codec
                   r = subprocess.run(
                       ['sips', '-s', 'format', 'png', path, '--out', out_png],
                       capture_output=True, text=True, timeout=30,
@@ -59,7 +99,19 @@ jobs:
                            'ASAN_OPTIONS': 'detect_oob_reads=1:halt_on_error=0'},
                   )
                   elapsed = time.time() - t0
-                  status = 'CRASH' if r.returncode != 0 else 'OK'
+                  # rc=0: clean decode
+                  # rc=1: sips usage error (shouldn't happen)
+                  # rc=13: "Cannot extract image from file" — codec/format failure
+                  # rc=139: SIGSEGV (crash!) — potential bug
+                  # rc=6: SIGABRT (crash!) — potential bug
+                  if r.returncode == 0:
+                      status = 'OK'
+                  elif r.returncode in (139, 6, 11, 5):
+                      status = 'CRASH'
+                  elif r.returncode == 13:
+                      status = 'DECODE_ERR'   # can't extract — codec path not reached OR invalid DNG
+                  else:
+                      status = f'ERR_{r.returncode}'
                   result = {
                       'file': fname,
                       'status': status,
@@ -71,81 +123,81 @@ jobs:
               except subprocess.TimeoutExpired:
                   elapsed = time.time() - t0
                   result = {
-                      'file': fname,
-                      'status': 'HANG',
-                      'rc': -1,
-                      'elapsed': round(elapsed, 2),
-                      'stdout': '',
-                      'stderr': 'TIMEOUT',
+                      'file': fname, 'status': 'HANG',
+                      'rc': -1, 'elapsed': round(elapsed, 2),
+                      'stdout': '', 'stderr': 'TIMEOUT',
                   }
 
               results.append(result)
 
-              icon = {'OK': '  [ok]', 'CRASH': '[CRASH]', 'HANG': '[ HANG]'}[result['status']]
-              print(f"{icon} {fname}  rc={result['rc']}  {elapsed:.2f}s")
-              if result['stderr']:
-                  print(f"        stderr: {result['stderr'][:100]}")
-              if result['status'] != 'OK':
-                  print(f"        stdout: {result['stdout'][:200]}")
+              icon = {
+                  'OK':         '     [ok]',
+                  'CRASH':      '  [CRASH]',
+                  'HANG':       '   [HANG]',
+                  'DECODE_ERR': '[DEC-ERR]',
+              }.get(result['status'], f'[{result["status"]}]')
+              print(f"{icon}  {fname:<52}  rc={result['rc']:>4}  {elapsed:.2f}s")
+              if result['stderr'] and result['status'] not in ('OK',):
+                  print(f"           stderr: {result['stderr'][:120]}")
 
           # Summary
-          crashes = [r for r in results if r['status'] == 'CRASH']
-          hangs   = [r for r in results if r['status'] == 'HANG']
-          ok      = [r for r in results if r['status'] == 'OK']
+          crashes     = [r for r in results if r['status'] == 'CRASH']
+          hangs       = [r for r in results if r['status'] == 'HANG']
+          ok          = [r for r in results if r['status'] == 'OK']
+          decode_errs = [r for r in results if r['status'] == 'DECODE_ERR']
+          other_errs  = [r for r in results if r['status'] not in ('OK','CRASH','HANG','DECODE_ERR')]
 
-          print(f"\n{'='*60}")
-          print(f"RESULTS: ok={len(ok)}  crash={len(crashes)}  hang={len(hangs)}")
-          print(f"{'='*60}\n")
+          print(f"\n{'='*70}")
+          print(f"RESULTS: ok={len(ok)}  crash={len(crashes)}  hang={len(hangs)}  "
+                f"decode_err={len(decode_errs)}  other={len(other_errs)}")
+          print(f"{'='*70}\n")
+
+          if ok:
+              print(f"DECODED OK ({len(ok)} files) — these reached the codec and succeeded:")
+              for r in ok:
+                  print(f"  {r['file']}")
+
+          if decode_errs:
+              print(f"\nDECODE ERRORS ({len(decode_errs)}) — rc=13, codec/DNG validation failed:")
+              for r in decode_errs:
+                  print(f"  {r['file']}")
 
           if crashes:
-              print("CRASH FINDINGS:")
+              print(f"\n*** CRASH FINDINGS ({len(crashes)}) ***")
               for r in crashes:
                   print(f"  {r['file']}  rc={r['rc']}")
                   print(f"    {r['stderr']}")
 
           if hangs:
-              print("\nHANG FINDINGS:")
+              print(f"\nHANG FINDINGS ({len(hangs)}):")
               for r in hangs:
                   print(f"  {r['file']}")
 
-          # Write JSON report for artifact upload
           with open('crash_report.json', 'w') as f:
               json.dump(results, f, indent=2)
 
-          # Set outputs for subsequent steps
           with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
               f.write(f"crash_count={len(crashes)}\n")
               f.write(f"hang_count={len(hangs)}\n")
+              f.write(f"ok_count={len(ok)}\n")
+              f.write(f"decode_err_count={len(decode_errs)}\n")
 
-          # Exit 1 if any crashes found (marks the action as failed/notable)
+          # Fail the step on crashes/hangs to make them easy to spot
           if crashes or hangs:
               sys.exit(1)
           PYEOF
 
-      - name: Collect crash reports from macOS
+      - name: Collect macOS crash reports
         if: always()
         run: |
-          echo "=== System crash reports (sips / RawCamera) ==="
+          echo "=== System crash reports (sips / RawCamera / ImageIO) ==="
           CRASH_DIR="$HOME/Library/Logs/DiagnosticReports"
-          ls "$CRASH_DIR" 2>/dev/null | grep -iE "sips|rawcamera|imagei" || echo "No matching crash reports"
+          ls "$CRASH_DIR" 2>/dev/null | grep -iE "sips|rawcamera|imagei|imageio" || echo "No matching crash reports"
           for f in "$CRASH_DIR"/*sips*.ips "$CRASH_DIR"/*RawCamera*.ips 2>/dev/null; do
-            [ -f "$f" ] && echo "=== $f ===" && head -60 "$f"
+            [ -f "$f" ] && echo "=== $f ===" && head -80 "$f"
           done || true
 
-      - name: Check AddressSanitizer output (if available)
-        if: always()
-        run: |
-          # Re-run highest-priority files with ASAN env vars — force pixel decode
-          for f in corpus/j2k_3spp_1csiz_16b_512.dng corpus/j2k_4spp_1csiz_16b.dng corpus/jpegls_3spp_1nf_8b_256.dng; do
-            [ -f "$f" ] || continue
-            echo "=== ASAN decode: $f ==="
-            ASAN_OPTIONS=detect_oob_reads=1:halt_on_error=0 \
-            MallocScribble=1 \
-            MallocGuardEdges=1 \
-            sips -s format png "$f" --out /tmp/asan_out.png 2>&1 | head -40 || true
-          done
-
-      - name: Upload crash artifacts
+      - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -158,23 +210,31 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
 
-      - name: Print final verdict
+      - name: Final verdict
         if: always()
         run: |
           echo ""
-          echo "===================================="
+          echo "=============================================="
           echo " CRASH COUNT: ${{ steps.crash_test.outputs.crash_count || 0 }}"
           echo " HANG  COUNT: ${{ steps.crash_test.outputs.hang_count  || 0 }}"
-          echo "===================================="
+          echo " OK    COUNT: ${{ steps.crash_test.outputs.ok_count    || 0 }}"
+          echo " DEC ERR:     ${{ steps.crash_test.outputs.decode_err_count || 0 }}"
+          echo "=============================================="
           cat crash_report.json 2>/dev/null | python3 -c "
           import json,sys
           d=json.load(sys.stdin)
-          crashes=[r for r in d if r['status']!='OK']
+          crashes=[r for r in d if r['status']=='CRASH']
+          ok=[r for r in d if r['status']=='OK']
           if crashes:
               print('POTENTIAL FINDINGS:')
               for r in crashes:
-                  print(f'  [{r[\"status\"]}] {r[\"file\"]}  rc={r[\"rc\"]}')
+                  print(f'  [CRASH] {r[\"file\"]}  rc={r[\"rc\"]}')
                   print(f'    {r[\"stderr\"][:120]}')
-          else:
-              print('No crashes or hangs detected.')
+          if ok:
+              print(f'DECODED CLEAN: {len(ok)} files (codec path reached)')
+              for r in ok:
+                  print(f'  {r[\"file\"]}')
+          if not crashes and not ok:
+              print('No crashes and no successful decodes — all files hit rc=13 DECODE_ERR.')
+              print('The DNG tag set is likely incorrect. Check the DIAGNOSTIC steps above.')
           " || true
