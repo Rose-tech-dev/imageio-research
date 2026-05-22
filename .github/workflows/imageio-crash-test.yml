@@ -48,30 +48,41 @@ jobs:
           echo " NO_IMG → plugin loaded but pixel decode failed"
           echo " NO_SRC → ImageIO refused to open the file entirely"
           echo "======================================================"
-          cat > /tmp/iosrc.swift << 'SWEOF'
-import Foundation
-import CoreGraphics
-
-let dir = "corpus"
-guard let entries = try? FileManager.default.contentsOfDirectory(atPath: dir) else {
-    print("Cannot read corpus dir"); exit(1)
-}
-let files = entries.filter { $0.hasSuffix(".dng") }.sorted()
-
-for fname in files {
-    let url = URL(fileURLWithPath: "\(dir)/\(fname)") as CFURL
-    guard let src = CGImageSourceCreateWithURL(url, nil) else {
-        print("  [NO_SRC ] \(fname)")
-        continue
-    }
-    let uti = (CGImageSourceGetType(src) as String?) ?? "nil"
-    guard let img = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
-        print("  [NO_IMG ] \(fname)  uti=\(uti)")
-        continue
-    }
-    print("  [OK     ] \(fname)  uti=\(uti)  \(img.width)x\(img.height)px")
-}
-SWEOF
+          python3 << 'PYEOF'
+          # Write Swift file via Python (avoids YAML indentation issues with heredocs)
+          # \( in Swift string interpolation is kept literal via Python list-of-strings
+          lines = [
+              'import Foundation',
+              'import CoreGraphics',
+              '',
+              'let dir = "corpus"',
+              'guard let entries = try? FileManager.default.contentsOfDirectory(atPath: dir) else {',
+              '    print("Cannot read corpus dir"); exit(1)',
+              '}',
+              'let files = entries.filter { $0.hasSuffix(".dng") }.sorted()',
+              '',
+              'print(String(repeating: "=", count: 66))',
+              'print(" Swift CGImageSource direct decode — raw ImageIO pipeline")',
+              'print(" uti=com.adobe.raw-image → DNG Camera Raw plugin")',
+              'print(" uti=public.tiff         → generic TIFF plugin (Camera Raw skipped)")',
+              'print(String(repeating: "=", count: 66))',
+              '',
+              'for fname in files {',
+              '    let url = URL(fileURLWithPath: "\\(dir)/\\(fname)") as CFURL',
+              '    guard let src = CGImageSourceCreateWithURL(url, nil) else {',
+              '        print("  [NO_SRC ] \\(fname)")',
+              '        continue',
+              '    }',
+              '    let uti = (CGImageSourceGetType(src) as String?) ?? "nil"',
+              '    guard let img = CGImageSourceCreateImageAtIndex(src, 0, nil) else {',
+              '        print("  [NO_IMG ] \\(fname)  uti=\\(uti)")',
+              '        continue',
+              '    }',
+              '    print("  [OK     ] \\(fname)  uti=\\(uti)  \\(img.width)x\\(img.height)px")',
+              '}',
+          ]
+          open('/tmp/iosrc.swift', 'w').write('\n'.join(lines) + '\n')
+          PYEOF
           swift /tmp/iosrc.swift
 
       - name: DIAGNOSTIC - sips metadata read (sips -g all)
