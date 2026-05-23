@@ -795,20 +795,20 @@ jobs:
 
           files = sorted(
               f for f in os.listdir(corpus_dir)
-              if f.endswith(('.dng', '.bmp', '.png'))
+              if f.endswith(('.dng', '.bmp', '.png', '.ico'))
           )
           # For DNG/TIFF files use jpeg output (forces JPEGL decode path).
-          # For BMP/PNG use png output (native format → exercises the full decode path).
+          # For BMP/PNG/ICO use tiff output (lossless, exercises full decode path).
           # jpeg output forces the JPEG-Lossless decoder to actually run so we can see crashes.
-          print(f"Testing {len(files)} files (DNG+BMP+PNG) with sips forced decode...\n")
+          print(f"Testing {len(files)} files (DNG+BMP+PNG+ICO) with sips forced decode...\n")
           print(f"{'File':<55} {'Status':>8}  {'RC':>5}  {'Time':>6}")
           print("-" * 80)
 
           for fname in files:
               path = os.path.join(corpus_dir, fname)
-              # BMP/PNG: decode to tiff (avoids lossy recompression, exercises full decode)
+              # BMP/PNG/ICO: decode to tiff (lossless, exercises full decode path)
               # DNG/TIFF: decode to jpeg (forces JPEGL codec path per earlier format matrix)
-              out_fmt = 'tiff' if fname.endswith(('.bmp', '.png')) else 'jpeg'
+              out_fmt = 'tiff' if fname.endswith(('.bmp', '.png', '.ico')) else 'jpeg'
               out_file = f'/tmp/sips_out.{out_fmt}'
               t0 = time.time()
               try:
@@ -912,6 +912,111 @@ jobs:
               sys.exit(1)
           PYEOF
 
+      - name: ROUND5 PNG PALETTE ANALYSIS - confirm OOB read vs clamping
+        if: always()
+        continue-on-error: true
+        run: |
+          python3 << 'PYEOF'
+          import subprocess, os
+
+          # Round 4 found that PNG with 1-entry or 4-entry PLTE but pixel indices 200-255
+          # all decoded rc=0. We need to determine whether Apple's PNG decoder:
+          #   (A) clamped the OOB index to 0 or last-valid → safe (no OOB read)
+          #   (B) did an actual OOB palette read → silent memory disclosure
+          #
+          # Method: decode each OOB PNG to TIFF, then read the first pixel's RGB value.
+          # Expected PLTE colors (from build_png_palette_oob formula: i*17%256, i*31%256, i*47%256):
+          #   4-entry PLTE: entry 0=(0,0,0) entry 1=(17,31,47) entry 2=(34,62,94) entry 3=(51,93,141)
+          #   1-entry PLTE: entry 0=(0,0,0)
+          # If pixel is BLACK (0,0,0)      → clamped to index 0
+          # If pixel is entry 3 (51,93,141) → clamped to last valid
+          # If pixel is any OTHER color     → OOB palette read (information leak)
+          #
+          # We use a Swift program to read the decoded pixel precisely.
+
+          lines = [
+              'import Foundation',
+              'import ImageIO',
+              'import CoreGraphics',
+              '',
+              'struct Case {',
+              '    let path: String',
+              '    let palEntries: Int',
+              '    let pixelIndex: Int',
+              '}',
+              '',
+              'let cases: [Case] = [',
+              '    Case(path: "corpus/CTRL_png_indexed_256color.png",  palEntries: 256, pixelIndex: 100),',
+              '    Case(path: "corpus/png_palette_oob_1ent_idx255.png", palEntries: 1,   pixelIndex: 255),',
+              '    Case(path: "corpus/png_palette_oob_4ent_idx200.png", palEntries: 4,   pixelIndex: 200),',
+              '    Case(path: "corpus/png_palette_oob_4ent_idx255.png", palEntries: 4,   pixelIndex: 255),',
+              ']',
+              '',
+              'print(String(repeating: "=", count: 90))',
+              'print(" PNG palette OOB read analysis — pixel RGB value determines if index was clamped or OOB")',
+              'print(" Expected PLTE[0] = (0,0,0)  PLTE[1]=(17,31,47)  PLTE[2]=(34,62,94)  PLTE[3]=(51,93,141)")',
+              'print(String(repeating: "=", count: 90))',
+              '',
+              'for c in cases {',
+              '    let url = URL(fileURLWithPath: c.path) as CFURL',
+              '    guard let src = CGImageSourceCreateWithURL(url, nil) else {',
+              '        print("  [NO_SRC] \\(c.path)")',
+              '        continue',
+              '    }',
+              '    let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [String: Any]',
+              '    guard let img = CGImageSourceCreateImageAtIndex(src, 0, nil) else {',
+              '        print("  [NO_IMG] \\(c.path)")',
+              '        continue',
+              '    }',
+              '    // Decode into RGB context so we can read exact R,G,B values',
+              '    let cs = CGColorSpaceCreateDeviceRGB()',
+              '    let w = img.width, h = img.height',
+              '    guard let ctx = CGContext(data: nil, width: w, height: h,',
+              '        bitsPerComponent: 8, bytesPerRow: w * 4, space: cs,',
+              '        bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else {',
+              '        print("  [NO_CTX] \\(c.path)")',
+              '        continue',
+              '    }',
+              '    ctx.setFillColor(red: 0.5, green: 0.5, blue: 0.5, alpha: 1.0)  // gray fill',
+              '    ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))',
+              '    ctx.draw(img, in: CGRect(x: 0, y: 0, width: w, height: h))',
+              '    guard let ptr = ctx.data else {',
+              '        print("  [NO_DATA] \\(c.path)")',
+              '        continue',
+              '    }',
+              '    let r = ptr.load(fromByteOffset: 0, as: UInt8.self)',
+              '    let g = ptr.load(fromByteOffset: 1, as: UInt8.self)',
+              '    let b = ptr.load(fromByteOffset: 2, as: UInt8.self)',
+              '    // Determine what palette entry was used',
+              '    let clamped0     = (r == 0   && g == 0   && b == 0)',
+              '    let clamped1     = (r == 17  && g == 31  && b == 47)',
+              '    let clamped2     = (r == 34  && g == 62  && b == 94)',
+              '    let clamped3     = (r == 51  && g == 93  && b == 141)',
+              '    let gray_fill    = (r == 128 && g == 128 && b == 128)  // pre-fill, draw failed',
+              '    var verdict = ""',
+              '    if gray_fill {',
+              '        verdict = "DRAW_FAILED (pixel = pre-fill gray — PNG decode error)"',
+              '    } else if clamped0 {',
+              '        verdict = "clamped to PLTE[0]=(0,0,0) — SAFE (no OOB read)"',
+              '    } else if clamped3 {',
+              '        verdict = "clamped to PLTE[3]=(51,93,141) — SAFE (clamped to last valid)"',
+              '    } else if clamped1 {',
+              '        verdict = "clamped to PLTE[1]=(17,31,47) — SAFE"',
+              '    } else if clamped2 {',
+              '        verdict = "clamped to PLTE[2]=(34,62,94) — SAFE"',
+              '    } else {',
+              '        verdict = "*** UNEXPECTED RGB=(\\(r),\\(g),\\(b)) — potential OOB READ from heap ***"',
+              '    }',
+              '    let entry_info = c.palEntries == 1 ? "1-entry PLTE" : "\\(c.palEntries)-entry PLTE"',
+              '    print("  [\\(entry_info) idx=\\(c.pixelIndex)] RGB=(\\(r),\\(g),\\(b))  \\(verdict)")',
+              '}',
+          ]
+          open('/tmp/png_palette_analysis.swift', 'w').write('\n'.join(lines) + '\n')
+          PYEOF
+
+          echo "--- PNG palette OOB pixel-value analysis (confirms OOB read vs clamping) ---"
+          swift /tmp/png_palette_analysis.swift || echo "  [runner crashed rc=$?]"
+
       - name: NEW FORMAT TARGETS - BMP/PNG/Deflate CGImageSource direct pipeline
         if: always()
         continue-on-error: true
@@ -945,11 +1050,12 @@ jobs:
               '}',
               'let bmpFiles  = entries.filter { $0.hasSuffix(".bmp") }.sorted()',
               'let pngFiles  = entries.filter { $0.hasSuffix(".png") }.sorted()',
-              'let deflFiles = entries.filter { $0.hasSuffix(".dng") && ($0.contains("deflate") || $0.contains("j2k")) }.sorted()',
-              'let allFiles  = bmpFiles + pngFiles + deflFiles',
+              'let icoFiles  = entries.filter { $0.hasSuffix(".ico") }.sorted()',
+              'let deflFiles = entries.filter { $0.hasSuffix(".dng") && ($0.contains("deflate") || $0.contains("j2k") || $0.contains("packbits")) }.sorted()',
+              'let allFiles  = bmpFiles + pngFiles + icoFiles + deflFiles',
               '',
               'print(String(repeating: "=", count: 80))',
-              'print(" Swift CGImageSource — BMP / PNG / Deflate-TIFF / J2K-TIFF new format targets")',
+              'print(" Swift CGImageSource — BMP / PNG / ICO / Deflate-TIFF / PackBits-TIFF / J2K-TIFF targets")',
               'print(" [OK_MIDPOINT] = decoded successfully to midpoint pixel value (~128)")',
               'print(" [DRAW_FAILED] = CGImageSource accepted but pixel decode failed")',
               'print(" [NO_IMG     ] = CGImageSourceCreateImageAtIndex returned nil")',
@@ -1018,9 +1124,10 @@ jobs:
           corpus = 'corpus'
           bmp_files = sorted(f for f in os.listdir(corpus) if f.endswith('.bmp'))
           png_files = sorted(f for f in os.listdir(corpus) if f.endswith('.png'))
-          all_files = bmp_files + png_files
+          ico_files = sorted(f for f in os.listdir(corpus) if f.endswith('.ico'))
+          all_files = bmp_files + png_files + ico_files
 
-          print(f"Testing {len(all_files)} BMP+PNG files through sips with crash monitoring...\n")
+          print(f"Testing {len(all_files)} BMP+PNG+ICO files through sips with crash monitoring...\n")
           baseline = snapshot()
 
           for fname in all_files:
@@ -1230,6 +1337,7 @@ jobs:
             corpus/*.dng
             corpus/*.bmp
             corpus/*.png
+            corpus/*.ico
             ~/Library/Logs/DiagnosticReports/*sips*.ips
             ~/Library/Logs/DiagnosticReports/*sips*.crash
             ~/Library/Logs/DiagnosticReports/*qlmanage*.ips
