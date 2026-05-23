@@ -793,22 +793,27 @@ jobs:
           corpus_dir = 'corpus'
           results = []
 
-          files = sorted(f for f in os.listdir(corpus_dir) if f.endswith('.dng'))
-          # Use jpeg output: the sips format matrix showed jpeg=0 for TIFF+JPEGL files
-          # while png/bmp/tiff all return rc=13 (codec rejects those pixel-format paths).
+          files = sorted(
+              f for f in os.listdir(corpus_dir)
+              if f.endswith(('.dng', '.bmp', '.png'))
+          )
+          # For DNG/TIFF files use jpeg output (forces JPEGL decode path).
+          # For BMP/PNG use png output (native format → exercises the full decode path).
           # jpeg output forces the JPEG-Lossless decoder to actually run so we can see crashes.
-          print(f"Testing {len(files)} files with sips -s format jpeg (forces JPEGL decode)...\n")
+          print(f"Testing {len(files)} files (DNG+BMP+PNG) with sips forced decode...\n")
           print(f"{'File':<55} {'Status':>8}  {'RC':>5}  {'Time':>6}")
           print("-" * 80)
 
-          out_jpeg = '/tmp/sips_out.jpeg'
-
           for fname in files:
               path = os.path.join(corpus_dir, fname)
+              # BMP/PNG: decode to tiff (avoids lossy recompression, exercises full decode)
+              # DNG/TIFF: decode to jpeg (forces JPEGL codec path per earlier format matrix)
+              out_fmt = 'tiff' if fname.endswith(('.bmp', '.png')) else 'jpeg'
+              out_file = f'/tmp/sips_out.{out_fmt}'
               t0 = time.time()
               try:
                   r = subprocess.run(
-                      ['sips', '-s', 'format', 'jpeg', path, '--out', out_jpeg],
+                      ['sips', '-s', 'format', out_fmt, path, '--out', out_file],
                       capture_output=True, text=True, timeout=30,
                       env={**os.environ,
                            'MallocScribble': '1',
@@ -907,6 +912,157 @@ jobs:
               sys.exit(1)
           PYEOF
 
+      - name: NEW FORMAT TARGETS - BMP/PNG/Deflate CGImageSource direct pipeline
+        if: always()
+        continue-on-error: true
+        run: |
+          python3 << 'PYEOF'
+          import subprocess, os, time
+
+          CRASH_DIR = os.path.expanduser("~/Library/Logs/DiagnosticReports")
+
+          def snapshot():
+              try:   return set(os.listdir(CRASH_DIR))
+              except FileNotFoundError: return set()
+
+          def read_crash(path):
+              try:
+                  with open(path, errors='replace') as f: return f.read(3000)
+              except Exception as e: return f'(unreadable: {e})'
+
+          # Write the Swift test script inline via Python to avoid YAML/heredoc issues
+          lines = [
+              'import Foundation',
+              'import ImageIO',
+              'import CoreGraphics',
+              '',
+              '// BMP/PNG/Deflate-TIFF direct ImageIO pipeline test.',
+              '// Exercises Apple BMPImagePlugin, PNGImagePlugin, and TIFF deflate decoder.',
+              '',
+              'let corpusDir = "corpus"',
+              'guard let entries = try? FileManager.default.contentsOfDirectory(atPath: corpusDir) else {',
+              '    print("Cannot list corpus dir"); exit(1)',
+              '}',
+              'let bmpFiles  = entries.filter { $0.hasSuffix(".bmp") }.sorted()',
+              'let pngFiles  = entries.filter { $0.hasSuffix(".png") }.sorted()',
+              'let deflFiles = entries.filter { $0.hasSuffix(".dng") && ($0.contains("deflate") || $0.contains("j2k")) }.sorted()',
+              'let allFiles  = bmpFiles + pngFiles + deflFiles',
+              '',
+              'print(String(repeating: "=", count: 80))',
+              'print(" Swift CGImageSource — BMP / PNG / Deflate-TIFF / J2K-TIFF new format targets")',
+              'print(" [OK_MIDPOINT] = decoded successfully to midpoint pixel value (~128)")',
+              'print(" [DRAW_FAILED] = CGImageSource accepted but pixel decode failed")',
+              'print(" [NO_IMG     ] = CGImageSourceCreateImageAtIndex returned nil")',
+              'print(" [NO_SRC     ] = CGImageSourceCreateWithURL returned nil (format rejected)")',
+              'print(String(repeating: "=", count: 80))',
+              '',
+              'for fname in allFiles {',
+              '    let path = "\\(corpusDir)/\\(fname)"',
+              '    let url = URL(fileURLWithPath: path) as CFURL',
+              '    guard let src = CGImageSourceCreateWithURL(url, nil) else {',
+              '        print("  [NO_SRC     ] \\(fname)")',
+              '        continue',
+              '    }',
+              '    let uti = (CGImageSourceGetType(src) as String?) ?? "nil"',
+              '    guard let img = CGImageSourceCreateImageAtIndex(src, 0, nil) else {',
+              '        print("  [NO_IMG     ] \\(fname)  uti=\\(uti)")',
+              '        continue',
+              '    }',
+              '    let w = img.width, h = img.height',
+              '    let cs = CGColorSpaceCreateDeviceGray()',
+              '    guard let ctx = CGContext(data: nil, width: w, height: h,',
+              '        bitsPerComponent: 8, bytesPerRow: w, space: cs,',
+              '        bitmapInfo: CGImageAlphaInfo.none.rawValue) else {',
+              '        print("  [NO_CTX     ] \\(fname)")',
+              '        continue',
+              '    }',
+              '    ctx.setFillColor(gray: 1.0, alpha: 1.0)',
+              '    ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))',
+              '    ctx.draw(img, in: CGRect(x: 0, y: 0, width: w, height: h))',
+              '    var px: UInt8 = 0',
+              '    if let p = ctx.data { px = p.load(as: UInt8.self) }',
+              '    let verdict = px == 255 ? "DRAW_FAILED" : (px >= 60 && px <= 200 ? "OK_MIDPOINT(px=\\(px))" : "px=\\(px)")',
+              '    print("  [\\(verdict)  ] \\(fname)  uti=\\(uti)  \\(w)x\\(h)")',
+              '}',
+          ]
+          open('/tmp/new_fmt_test.swift', 'w').write('\n'.join(lines) + '\n')
+          PYEOF
+
+          echo "--- Running Swift CGImageSource test for BMP/PNG/Deflate/J2K ---"
+          echo "--- If this process crashes (SIGSEGV/SIGABRT), a finding was triggered ---"
+
+          CRASH_BEFORE=$(ls ~/Library/Logs/DiagnosticReports/ 2>/dev/null | wc -l)
+          swift /tmp/new_fmt_test.swift || echo "  [CRASHED rc=$?] swift runner crashed"
+          CRASH_AFTER=$(ls ~/Library/Logs/DiagnosticReports/ 2>/dev/null | wc -l)
+
+          if [ "$CRASH_AFTER" -gt "$CRASH_BEFORE" ]; then
+            echo ""
+            echo "*** NEW CRASH REPORTS AFTER NEW FORMAT TEST ***"
+            ls ~/Library/Logs/DiagnosticReports/ | tail -n $((CRASH_AFTER - CRASH_BEFORE))
+          fi
+
+          echo ""
+          echo "--- sips forced decode for BMP/PNG (crash monitoring) ---"
+          python3 << 'PYEOF2'
+          import subprocess, os, time
+
+          CRASH_DIR = os.path.expanduser("~/Library/Logs/DiagnosticReports")
+          def snapshot():
+              try:   return set(os.listdir(CRASH_DIR))
+              except FileNotFoundError: return set()
+          def read_crash(path):
+              try:
+                  with open(path, errors='replace') as f: return f.read(3000)
+              except: return '(unreadable)'
+
+          corpus = 'corpus'
+          bmp_files = sorted(f for f in os.listdir(corpus) if f.endswith('.bmp'))
+          png_files = sorted(f for f in os.listdir(corpus) if f.endswith('.png'))
+          all_files = bmp_files + png_files
+
+          print(f"Testing {len(all_files)} BMP+PNG files through sips with crash monitoring...\n")
+          baseline = snapshot()
+
+          for fname in all_files:
+              path = os.path.join(corpus, fname)
+              ext = 'tiff' if fname.endswith('.bmp') else 'tiff'
+              before = snapshot()
+              t0 = time.time()
+              try:
+                  r = subprocess.run(
+                      ['sips', '-s', 'format', ext, path, '--out', '/tmp/sips_new_fmt.tiff'],
+                      capture_output=True, text=True, timeout=20,
+                      env={**os.environ,
+                           'MallocScribble': '1', 'MallocGuardEdges': '1'},
+                  )
+                  elapsed = time.time() - t0
+                  time.sleep(0.2)
+                  new = snapshot() - before
+                  if new:
+                      print(f"  [*** CRASH] {fname}  rc={r.returncode}  {elapsed:.1f}s")
+                      for rep in sorted(new):
+                          rp = os.path.join(CRASH_DIR, rep)
+                          print(f"  === {rep} ===")
+                          print(read_crash(rp))
+                  elif r.returncode == 0:
+                      print(f"  [OK      ]  {fname}  rc=0  {elapsed:.2f}s")
+                  elif r.returncode == 13:
+                      print(f"  [DEC-ERR ]  {fname}  rc=13 (format not supported or rejected)")
+                  else:
+                      crash_codes = {139: 'SIGSEGV', 6: 'SIGABRT', 11: 'SIGSEGV'}
+                      tag = crash_codes.get(r.returncode, f'rc={r.returncode}')
+                      print(f"  [ERR {tag}]  {fname}  {elapsed:.1f}s")
+                      if r.stderr.strip():
+                          print(f"    {r.stderr.strip()[:120]}")
+              except subprocess.TimeoutExpired:
+                  print(f"  [HANG    ]  {fname}  ({time.time()-t0:.0f}s)")
+
+          total_new = snapshot() - baseline
+          print(f"\nTotal new crash reports this step: {len(total_new)}")
+          for r in sorted(total_new):
+              print(f"  {r}")
+          PYEOF2
+
       - name: DIAGNOSTIC - decode output analysis (detect silent OOB via channel count)
         if: always()
         continue-on-error: true
@@ -940,6 +1096,14 @@ jobs:
               ('corpus/tiff_jpegls_1spp_3nf_8b.dng',            1, 3, '?'),  # OOB WRITE
               ('corpus/tiff_jpegls_3spp_1nf_8b_256.dng',        3, 1, '?'),
               ('corpus/tiff_jpegls_1spp_3nf_8b_256.dng',        1, 3, '?'),
+              # NEW ROUND 4: TIFF + Deflate decompressed size overflow
+              ('corpus/CTRL_tiff_deflate_64x64_3spp.dng',       3, 3, 3),
+              ('corpus/tiff_deflate_overflow_1mb.dng',           3, 3, '?'),
+              ('corpus/tiff_deflate_overflow_4mb.dng',           3, 3, '?'),
+              # NEW ROUND 4: Plain TIFF + J2K SPP/Csiz mismatch (no Camera Raw)
+              ('corpus/CTRL_plain_tiff_j2k_3spp_3csiz.dng',     3, 3, 3),
+              ('corpus/plain_tiff_j2k_3spp_1csiz.dng',          3, 1, '?'),
+              ('corpus/plain_tiff_j2k_1spp_3csiz.dng',          1, 3, '?'),
           ]
 
           print("=" * 90)
@@ -1063,7 +1227,9 @@ jobs:
           path: |
             crash_report.json
             decode_analysis.json
-            corpus/
+            corpus/*.dng
+            corpus/*.bmp
+            corpus/*.png
             ~/Library/Logs/DiagnosticReports/*sips*.ips
             ~/Library/Logs/DiagnosticReports/*sips*.crash
             ~/Library/Logs/DiagnosticReports/*qlmanage*.ips

