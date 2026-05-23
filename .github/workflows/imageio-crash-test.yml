@@ -912,7 +912,9 @@ jobs:
         continue-on-error: true
         run: |
           python3 << 'PYEOF'
-          import subprocess, os
+          import subprocess, os, json
+
+          analysis_rows = []
 
           # For mismatch files that return rc=0 with jpeg output, check the OUTPUT JPEG.
           # If SPP=1 (1-channel buffer allocated) but Nf=3 (JPEGL writes 3 channels):
@@ -1009,6 +1011,16 @@ jobs:
                   else:
                       break
               print(f"    JPEG markers: {' → '.join(markers)}  (file={os.path.getsize(out)}B, file:{file_type[:60]})")
+              analysis_rows.append({
+                  'file': fname, 'spp': spp, 'nf': nf,
+                  'ch_out': spp_out, 'verdict': verdict,
+                  'markers': markers,
+              })
+
+          import json
+          with open('decode_analysis.json', 'w') as f:
+              json.dump(analysis_rows, f, indent=2)
+          print('\n[+] decode_analysis.json written')
           PYEOF
 
       - name: Collect macOS crash reports
@@ -1040,6 +1052,7 @@ jobs:
           name: crash-results
           path: |
             crash_report.json
+            decode_analysis.json
             corpus/
             ~/Library/Logs/DiagnosticReports/*sips*.ips
             ~/Library/Logs/DiagnosticReports/*sips*.crash
