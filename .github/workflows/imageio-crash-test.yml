@@ -795,20 +795,20 @@ jobs:
 
           files = sorted(
               f for f in os.listdir(corpus_dir)
-              if f.endswith(('.dng', '.bmp', '.png', '.ico'))
+              if f.endswith(('.dng', '.bmp', '.png', '.ico', '.gif', '.webp'))
           )
           # For DNG/TIFF files use jpeg output (forces JPEGL decode path).
-          # For BMP/PNG/ICO use tiff output (lossless, exercises full decode path).
+          # For BMP/PNG/ICO/GIF/WebP use tiff output (lossless, exercises full decode path).
           # jpeg output forces the JPEG-Lossless decoder to actually run so we can see crashes.
-          print(f"Testing {len(files)} files (DNG+BMP+PNG+ICO) with sips forced decode...\n")
+          print(f"Testing {len(files)} files (DNG+BMP+PNG+ICO+GIF+WebP) with sips forced decode...\n")
           print(f"{'File':<55} {'Status':>8}  {'RC':>5}  {'Time':>6}")
           print("-" * 80)
 
           for fname in files:
               path = os.path.join(corpus_dir, fname)
-              # BMP/PNG/ICO: decode to tiff (lossless, exercises full decode path)
+              # BMP/PNG/ICO/GIF/WebP: decode to tiff (lossless, exercises full decode path)
               # DNG/TIFF: decode to jpeg (forces JPEGL codec path per earlier format matrix)
-              out_fmt = 'tiff' if fname.endswith(('.bmp', '.png', '.ico')) else 'jpeg'
+              out_fmt = 'tiff' if fname.endswith(('.bmp', '.png', '.ico', '.gif', '.webp')) else 'jpeg'
               out_file = f'/tmp/sips_out.{out_fmt}'
               t0 = time.time()
               try:
@@ -1015,7 +1015,7 @@ jobs:
           PYEOF
 
           echo "--- PNG palette OOB pixel-value analysis (confirms OOB read vs clamping) ---"
-          swift /tmp/png_palette_analysis.swift || echo "  [runner crashed rc=$?]"
+          swift /tmp/png_palette_analysis.swift 2>&1 | tee palette_analysis.txt || echo "  [runner crashed rc=$?]"
 
       - name: NEW FORMAT TARGETS - BMP/PNG/Deflate CGImageSource direct pipeline
         if: always()
@@ -1051,11 +1051,13 @@ jobs:
               'let bmpFiles  = entries.filter { $0.hasSuffix(".bmp") }.sorted()',
               'let pngFiles  = entries.filter { $0.hasSuffix(".png") }.sorted()',
               'let icoFiles  = entries.filter { $0.hasSuffix(".ico") }.sorted()',
-              'let deflFiles = entries.filter { $0.hasSuffix(".dng") && ($0.contains("deflate") || $0.contains("j2k") || $0.contains("packbits")) }.sorted()',
-              'let allFiles  = bmpFiles + pngFiles + icoFiles + deflFiles',
+              'let gifFiles  = entries.filter { $0.hasSuffix(".gif") }.sorted()',
+              'let webpFiles = entries.filter { $0.hasSuffix(".webp") }.sorted()',
+              'let deflFiles = entries.filter { $0.hasSuffix(".dng") && ($0.contains("deflate") || $0.contains("j2k") || $0.contains("packbits") || $0.contains("lzw")) }.sorted()',
+              'let allFiles  = bmpFiles + pngFiles + icoFiles + gifFiles + webpFiles + deflFiles',
               '',
               'print(String(repeating: "=", count: 80))',
-              'print(" Swift CGImageSource — BMP / PNG / ICO / Deflate-TIFF / PackBits-TIFF / J2K-TIFF targets")',
+              'print(" Swift CGImageSource — BMP / PNG / ICO / GIF / WebP / LZW-TIFF / Deflate-TIFF / PackBits-TIFF targets")',
               'print(" [OK_MIDPOINT] = decoded successfully to midpoint pixel value (~128)")',
               'print(" [DRAW_FAILED] = CGImageSource accepted but pixel decode failed")',
               'print(" [NO_IMG     ] = CGImageSourceCreateImageAtIndex returned nil")',
@@ -1122,12 +1124,14 @@ jobs:
               except: return '(unreadable)'
 
           corpus = 'corpus'
-          bmp_files = sorted(f for f in os.listdir(corpus) if f.endswith('.bmp'))
-          png_files = sorted(f for f in os.listdir(corpus) if f.endswith('.png'))
-          ico_files = sorted(f for f in os.listdir(corpus) if f.endswith('.ico'))
-          all_files = bmp_files + png_files + ico_files
+          bmp_files  = sorted(f for f in os.listdir(corpus) if f.endswith('.bmp'))
+          png_files  = sorted(f for f in os.listdir(corpus) if f.endswith('.png'))
+          ico_files  = sorted(f for f in os.listdir(corpus) if f.endswith('.ico'))
+          gif_files  = sorted(f for f in os.listdir(corpus) if f.endswith('.gif'))
+          webp_files = sorted(f for f in os.listdir(corpus) if f.endswith('.webp'))
+          all_files  = bmp_files + png_files + ico_files + gif_files + webp_files
 
-          print(f"Testing {len(all_files)} BMP+PNG+ICO files through sips with crash monitoring...\n")
+          print(f"Testing {len(all_files)} BMP+PNG+ICO+GIF+WebP files through sips with crash monitoring...\n")
           baseline = snapshot()
 
           for fname in all_files:
@@ -1211,6 +1215,10 @@ jobs:
               ('corpus/CTRL_plain_tiff_j2k_3spp_3csiz.dng',     3, 3, 3),
               ('corpus/plain_tiff_j2k_3spp_1csiz.dng',          3, 1, '?'),
               ('corpus/plain_tiff_j2k_1spp_3csiz.dng',          1, 3, '?'),
+              # ROUND 6: TIFF + LZW overflow (same attack class as Deflate)
+              ('corpus/CTRL_tiff_lzw_64x64_3spp.dng',           3, 3, 3),
+              ('corpus/tiff_lzw_overflow_1mb.dng',               3, 3, '?'),
+              ('corpus/tiff_lzw_overflow_4mb.dng',               3, 3, '?'),
           ]
 
           print("=" * 90)
@@ -1334,10 +1342,13 @@ jobs:
           path: |
             crash_report.json
             decode_analysis.json
+            palette_analysis.txt
             corpus/*.dng
             corpus/*.bmp
             corpus/*.png
             corpus/*.ico
+            corpus/*.gif
+            corpus/*.webp
             ~/Library/Logs/DiagnosticReports/*sips*.ips
             ~/Library/Logs/DiagnosticReports/*sips*.crash
             ~/Library/Logs/DiagnosticReports/*qlmanage*.ips
