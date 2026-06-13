@@ -1,0 +1,80 @@
+name: macOS 15 Recon
+
+on:
+  workflow_dispatch:
+
+jobs:
+  recon:
+    runs-on: macos-15
+    steps:
+      - name: mirroringd binary location
+        run: |
+          echo "=== MIRRORINGD BINARY ==="
+          find /System /usr/libexec -name "*mirror*" 2>/dev/null
+          find /System /usr/libexec -name "*mirroring*" 2>/dev/null
+
+      - name: mirroringd entitlements
+        run: |
+          echo "=== ENTITLEMENTS ==="
+          BINARY=$(find /usr/libexec /System/Library -name "mirroringd" 2>/dev/null | head -1)
+          if [ -n "$BINARY" ]; then
+            codesign -d --entitlements :- "$BINARY" 2>/dev/null
+          else
+            echo "mirroringd not found at expected paths"
+          fi
+
+      - name: mirroringd linked frameworks
+        run: |
+          echo "=== LINKED FRAMEWORKS ==="
+          BINARY=$(find /usr/libexec /System/Library -name "mirroringd" 2>/dev/null | head -1)
+          if [ -n "$BINARY" ]; then
+            otool -L "$BINARY"
+          fi
+
+      - name: mirroringd strings of interest
+        run: |
+          echo "=== STRINGS (XPC, IPC, IOSurface, USB, pairing) ==="
+          BINARY=$(find /usr/libexec /System/Library -name "mirroringd" 2>/dev/null | head -1)
+          if [ -n "$BINARY" ]; then
+            strings "$BINARY" | grep -iE "(xpc|mach|iosurface|pairing|trust|usb|clipboard|touch|inject|framebuffer|auth|session|token)" | sort -u
+          fi
+
+      - name: LaunchDaemon plist
+        run: |
+          echo "=== LAUNCHDAEMON PLIST ==="
+          find /System/Library/LaunchDaemons /Library/LaunchDaemons -name "*mirror*" 2>/dev/null | xargs cat 2>/dev/null
+
+      - name: usbmuxd strings (new message types)
+        run: |
+          echo "=== USBMUXD NEW MESSAGE TYPES ==="
+          strings /usr/libexec/usbmuxd 2>/dev/null | grep -iE "(mirror|screen|remote|control|display|frame)" | sort -u
+
+      - name: new private frameworks macOS 15
+        run: |
+          echo "=== PRIVATE FRAMEWORKS ==="
+          ls /System/Library/PrivateFrameworks/ | grep -iE "(mirror|mirroring|remote|continuity|phone)"
+
+      - name: IOSurface related entitlements search
+        run: |
+          echo "=== IOSURFACE ENTITLEMENTS ACROSS SYSTEM BINARIES ==="
+          for bin in /usr/libexec/mirroringd /System/Library/PrivateFrameworks/CoreRemoteUI.framework/CoreRemoteUI 2>/dev/null; do
+            if [ -f "$bin" ]; then
+              echo "--- $bin ---"
+              codesign -d --entitlements :- "$bin" 2>/dev/null | grep -i surface
+            fi
+          done
+
+      - name: mach services registered
+        run: |
+          echo "=== MACH SERVICES ==="
+          sudo launchctl print system/ 2>/dev/null | grep -i mirror
+
+      - name: pairing trust store location
+        run: |
+          echo "=== TRUST STORE SEARCH ==="
+          sudo find /var/db /Library/Preferences /private/var -name "*mirror*" -o -name "*pairing*" 2>/dev/null | head -30
+
+      - name: sandbox profile
+        run: |
+          echo "=== SANDBOX PROFILE ==="
+          find /System/Library/Sandbox/Profiles -name "*mirror*" 2>/dev/null | xargs cat 2>/dev/null
