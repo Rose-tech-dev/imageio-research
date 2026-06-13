@@ -89,7 +89,7 @@ func probe(service name: String, protocol proto: Protocol, waitSecs: Int = 4,
         sema.signal()
     }
 
-    action(proxy, sema)
+    action(proxy as AnyObject, sema)
 
     if sema.wait(timeout: .now() + .seconds(waitSecs)) == .timedOut {
         result = "TIMEOUT (\(waitSecs)s) *** ACCEPTED — NO ENTITLEMENT CHECK ***"

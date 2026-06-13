@@ -1,0 +1,256 @@
+name: Apple Intelligence Gen 3 - Confirmed Service Names
+
+# Gen 3: All probed Mach service names are now CONFIRMED from launchd plist files.
+# No guessing. This run will tell us definitively which services enforce entitlement checks.
+#
+# Priority targets:
+#   com.apple.intelligenceflow.uiContext    — screen content access (CRITICAL if accepted)
+#   com.apple.OSIntelligence               — root daemon (CRITICAL if accepted)
+#   com.apple.intelligenceflow.orchestrator — AI query routing
+#   com.apple.intelligenceflow.querydecoration — personal context attached to queries
+#   com.apple.suggestd.mail-intelligence   — mail data
+#   com.apple.assistant.client             — Siri (confirmed assistantd PID 528)
+#   com.apple.privatecloudcomputed         — PCC (confirmed running PID 2971)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'intelligenceflow_probe.swift'
+      - '.github/workflows/intelligenceflow-gen3-probe.yml'
+
+jobs:
+  gen3-probe:
+    runs-on: macos-15
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: System info
+        run: |
+          sw_vers
+          echo "XNU: $(uname -r)"
+          echo "UID: $(id -u)  USER: $(whoami)"
+          echo "SIP: $(csrutil status 2>/dev/null || echo unknown)"
+          echo "Entitlements on this runner process:"
+          codesign -d --entitlements - /proc/self/exe 2>/dev/null \
+            || codesign -d --entitlements - "$(which swift)" 2>/dev/null \
+            || echo "(entitlements check unavailable)"
+
+      # ── VERIFY all target daemons are actually running ─────────────────
+      - name: Pre-flight - Verify target daemons
+        run: |
+          echo "=== RUNNING DAEMONS (intelligence / siri / assistant) ==="
+          ps aux | grep -E "intelligenceplatformd|intelligenceflowd|intelligencecontextd|siriinferenced|ospredictiond|assistantd|suggestd|privatecloudcomputed" \
+            | grep -v grep | awk '{print $1, $2, $11}' | sort -k3
+
+          echo ""
+          echo "=== LAUNCHCTL LIST (relevant services) ==="
+          launchctl list | grep -E "intelligenceplatformd|intelligenceflowd|intelligencecontextd|siriinferenced|ospredictiond|assistantd|suggestd|privatecloudcomputed|modelcatalog|sirisuggestions" | sort
+
+          echo ""
+          echo "=== ospredictiond (SYSTEM daemon — runs as root) ==="
+          OPID=$(pgrep -x "ospredictiond" 2>/dev/null | head -1)
+          [ -n "$OPID" ] && ps -p "$OPID" -o pid,ppid,user,%cpu,command \
+            || echo "(ospredictiond not found via pgrep, checking launchctl...)"
+          launchctl list | grep -i "osprediction\|OSIntelligence" || echo "(not listed in launchctl)"
+
+          echo ""
+          echo "=== privatecloudcomputed ==="
+          PCCPID=$(pgrep -x "privatecloudcomputed" 2>/dev/null | head -1)
+          [ -n "$PCCPID" ] && ps -p "$PCCPID" -o pid,ppid,user,%cpu,command \
+            || echo "(privatecloudcomputed PID not found via pgrep)"
+
+          echo ""
+          echo "=== siriinferenced MachServices from plist ==="
+          SIRIPLIST=$(find /System/Library/LaunchDaemons /System/Library/LaunchAgents \
+            -name "*siriinferenced*" 2>/dev/null | head -1)
+          [ -n "$SIRIPLIST" ] && plutil -p "$SIRIPLIST" | grep -A2 "MachServices" \
+            || echo "(plist not found)"
+        continue-on-error: true
+
+      # ── RECON: Confirm service names + find ChatGPT broker ────────────
+      - name: Recon - ChatGPT and external model broker services
+        run: |
+          echo "=== Looking for ChatGPT/external model broker in plists ==="
+          grep -rl "chatgpt\|openai\|ChatGPT\|OpenAI\|ExternalModel\|externalmodel\|brokerservice" \
+            /System/Library/LaunchDaemons /System/Library/LaunchAgents \
+            /System/Library/PrivateFrameworks 2>/dev/null | head -15
+
+          echo ""
+          echo "=== Plists that reference 'external' in AI context ==="
+          find /System/Library/LaunchDaemons /System/Library/LaunchAgents \
+            -name "*.plist" 2>/dev/null \
+            | xargs grep -li "intelligenceflow\|IntelligenceFlow\|privatecloudcomputed\|siriinferenced" \
+              2>/dev/null | head -15 | while read f; do
+            echo "FILE: $f"
+            plutil -p "$f" 2>/dev/null | grep -iE "MachServices|ExternalModel|ChatGPT|OpenAI|broker|relay" | head -8
+            echo "---"
+          done
+
+          echo ""
+          echo "=== IntelligenceFlowRuntime framework — strings for service names ==="
+          FW="/System/Library/PrivateFrameworks/IntelligenceFlowRuntime.framework"
+          if [ -d "$FW" ]; then
+            ls -la "$FW/Versions/A/" 2>/dev/null | head -10
+            find "$FW" -type f -name "*.plist" 2>/dev/null | while read f; do
+              echo "PLIST: $f"
+              plutil -p "$f" 2>/dev/null | grep -iE "com\.apple\.|MachServices" | head -15
+            done
+          else
+            echo "(IntelligenceFlowRuntime.framework not found at expected path)"
+            find /System/Library/PrivateFrameworks -maxdepth 1 -name "*Intelligence*" -o -name "*Flow*" \
+              2>/dev/null | head -20
+          fi
+
+          echo ""
+          echo "=== assistantd plist (full MachServices) ==="
+          find /System/Library/LaunchDaemons /System/Library/LaunchAgents \
+            -name "*assistantd*" -o -name "*assistant.plist" 2>/dev/null | while read f; do
+            echo "FILE: $f"
+            plutil -p "$f" 2>/dev/null | grep -A2 -B1 "MachServices\|com\.apple\.assistant" | head -30
+          done
+
+          echo ""
+          echo "=== modelcatalog plist ==="
+          find /System/Library/LaunchDaemons /System/Library/LaunchAgents \
+            -name "*modelcatalog*" -o -name "*ModelCatalog*" 2>/dev/null | while read f; do
+            echo "FILE: $f"
+            plutil -p "$f" 2>/dev/null | head -30
+          done
+
+          echo ""
+          echo "=== Mach services with 'external' or 'broker' ==="
+          grep -r "external\|broker\|relay\|openai\|chatgpt" \
+            /System/Library/LaunchDaemons /System/Library/LaunchAgents \
+            2>/dev/null | grep -iE "com\.apple\." | head -20
+        continue-on-error: true
+
+      # ── COMPILE ────────────────────────────────────────────────────────
+      - name: Compile intelligenceflow_probe.swift
+        run: |
+          echo "=== Compiling Gen 3 probe ==="
+          swiftc intelligenceflow_probe.swift -o /tmp/if_probe 2>&1
+          echo "Exit code: $?"
+          ls -la /tmp/if_probe 2>/dev/null || echo "(binary not created — compile failed)"
+
+      # ── MAIN PROBE ─────────────────────────────────────────────────────
+      - name: Run Gen 3 probe (25 confirmed service names)
+        timeout-minutes: 8
+        run: |
+          echo "=== Running intelligenceflow_probe ==="
+          echo "PID: $$  UID: $(id -u)  No special entitlements."
+          echo ""
+          /tmp/if_probe 2>&1 || echo "(probe exited with error)"
+
+      # ── LOGS (collected immediately after probe — before daemons cool) ──
+      - name: Logs - intelligenceflowd + intelligencecontextd
+        run: |
+          echo "=== intelligenceflowd logs (last 5min) ==="
+          log show \
+            --predicate 'process == "intelligenceflowd" OR process == "intelligencecontextd"' \
+            --last 5m --info --debug 2>/dev/null | grep -v "^Timestamp" | head -200 \
+            || echo "(no logs)"
+
+          echo ""
+          echo "=== uiContext specific entries ==="
+          log show \
+            --predicate 'process == "intelligencecontextd" AND (message CONTAINS "uiContext" OR message CONTAINS "screen" OR message CONTAINS "denied" OR message CONTAINS "entitlement")' \
+            --last 5m --info --debug 2>/dev/null | head -60 || echo "(none)"
+        continue-on-error: true
+
+      - name: Logs - siriinferenced + sirisuggestions
+        run: |
+          echo "=== siriinferenced logs (last 5min) ==="
+          log show \
+            --predicate 'process == "siriinferenced" OR process == "sirisuggestionsd" OR process == "suggestd"' \
+            --last 5m --info --debug 2>/dev/null | grep -v "^Timestamp" | head -200 \
+            || echo "(no logs)"
+        continue-on-error: true
+
+      - name: Logs - ospredictiond (system root daemon)
+        run: |
+          echo "=== ospredictiond logs (last 5min) ==="
+          log show \
+            --predicate 'process == "ospredictiond" OR subsystem CONTAINS "OSIntelligence"' \
+            --last 5m --info --debug 2>/dev/null | grep -v "^Timestamp" | head -150 \
+            || echo "(no logs)"
+
+          echo ""
+          echo "=== ANY denial/entitlement log from OSIntelligence ==="
+          log show \
+            --predicate 'message CONTAINS "OSIntelligence" AND (message CONTAINS "deny" OR message CONTAINS "entitled" OR message CONTAINS "rejected")' \
+            --last 5m --info --debug 2>/dev/null | head -60 || echo "(none)"
+        continue-on-error: true
+
+      - name: Logs - assistantd
+        run: |
+          echo "=== assistantd logs (last 5min) ==="
+          log show \
+            --predicate 'process == "assistantd"' \
+            --last 5m --info 2>/dev/null | grep -v "^Timestamp" | head -150 \
+            || echo "(no logs)"
+        continue-on-error: true
+
+      - name: Logs - privatecloudcomputed
+        run: |
+          echo "=== privatecloudcomputed logs (last 5min) ==="
+          log show \
+            --predicate 'process == "privatecloudcomputed" OR subsystem CONTAINS "PrivateCloud"' \
+            --last 5m --info --debug 2>/dev/null | grep -v "^Timestamp" | head -150 \
+            || echo "(no logs)"
+        continue-on-error: true
+
+      # ── SANDBOXING / ENTITLEMENT CHECK ─────────────────────────────────
+      - name: Entitlement context - what this runner process has
+        run: |
+          echo "=== Runner process entitlements ==="
+          RUNNER_PID=$$
+          codesign -d --entitlements - /proc/$RUNNER_PID/exe 2>/dev/null || true
+
+          echo ""
+          echo "=== What entitlements does /bin/sh have ==="
+          codesign -d --entitlements - /bin/sh 2>/dev/null || true
+
+          echo ""
+          echo "=== Checking if sandbox is active ==="
+          sandbox-exec -p '(version 1)(deny default)' echo "sandbox works" 2>/dev/null \
+            || echo "(sandbox-exec unavailable or denied)"
+
+          echo ""
+          echo "=== What SIP covers for XPC ==="
+          csrutil status 2>/dev/null
+
+          echo ""
+          echo "=== AMFI / entitlement enforcement policy ==="
+          # Check if AMFI is enforcing strict entitlement checks
+          nvram boot-args 2>/dev/null | grep -iE "amfi|entitlement|debug" || echo "(default nvram boot-args)"
+          sysctl security.mac.amfi 2>/dev/null | head -5 || echo "(amfi sysctl not available)"
+        continue-on-error: true
+
+      # ── SUMMARY ────────────────────────────────────────────────────────
+      - name: Gen 3 Summary
+        run: |
+          echo "=== GEN 3 PROBE SUMMARY ==="
+          echo "Platform: macOS $(sw_vers -productVersion) ($(sw_vers -buildVersion))"
+          echo "Date: $(date)"
+          echo ""
+          echo "All 25 service names were confirmed from launchd plist files (not guessed)."
+          echo ""
+          echo "KEY: TIMEOUT = service accepted connection (potential auth bypass)"
+          echo "     INVALIDATED = service rejected at connection time (normal)"
+          echo "     INTERRUPTED = connection accepted but method rejected (partial bypass?)"
+          echo "     REPLY = method completed (definite finding)"
+          echo ""
+          echo "High-value targets:"
+          echo "  com.apple.intelligenceflow.uiContext   — reads screen content"
+          echo "  com.apple.OSIntelligence               — SYSTEM daemon (root)"
+          echo "  com.apple.intelligenceflow.orchestrator — AI model routing"
+          echo "  com.apple.intelligenceflow.querydecoration — personal context"
+          echo "  com.apple.suggestd.mail-intelligence   — mail data"
+          echo "  com.apple.assistant.client             — Siri interface"
+          echo "  com.apple.privatecloudcomputed         — PCC (external model gateway)"
+          echo ""
+          echo "Search this run for 'TIMEOUT' or '*** ACCEPTED' to find any bypass."
