@@ -1,0 +1,59 @@
+name: rapportd ObjC XPC Service Probe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile and run ObjC XPC probe
+        run: |
+          echo "=== Compiling Objective-C XPC probe ==="
+          clang -o xpc_probe xpc_probe.m -framework Foundation 2>&1
+          echo "Compile exit code: $?"
+
+          echo ""
+          echo "=== Running XPC probe ==="
+          ./xpc_probe 2>&1 || true
+
+      - name: Check rapportd logs after XPC probe
+        run: |
+          echo "=== rapportd logs after probe ==="
+          log show --predicate 'process == "rapportd"' --last 15s 2>/dev/null | \
+            grep -vE "(WiFiManagerClient|Logging)" | head -40 || true
+
+      - name: NSXPCConnection probe (Swift)
+        run: python3 nsxpc_probe.py 2>&1
+
+      - name: Verify rapportd reads user-domain preference _prefMaxConnectionCount
+        run: |
+          echo "=== Testing _prefMaxConnectionCount for preference domain proof ==="
+
+          defaults write com.apple.rapportd _prefMaxConnectionCount -int 9999
+          echo "Written _prefMaxConnectionCount=9999 to user domain"
+          echo "User pref file:"
+          ls -la ~/Library/Preferences/com.apple.rapportd.plist 2>/dev/null || echo "(none)"
+          echo "System pref file:"
+          ls -la /Library/Preferences/com.apple.rapportd.plist 2>/dev/null || echo "(none)"
+
+          echo ""
+          killall -HUP rapportd 2>/dev/null || true
+          sleep 4
+          echo "rapportd PID after restart: $(pgrep rapportd | head -1)"
+
+          echo ""
+          echo "=== CLinkD and RPNWNetworkAgent logs (looking for 9999) ==="
+          log show --predicate 'process == "rapportd"' --last 8s 2>/dev/null | \
+            grep -iE "(CLinkD|Max.connect|9999|connect.*count|connection)" | head -20 || true
+
+          echo ""
+          echo "=== ALL rapportd startup logs ==="
+          log show --predicate 'process == "rapportd"' --last 8s 2>/dev/null | \
+            grep -vE "(WiFiManagerClient|Logging)" | head -60 || true
+
+          defaults delete com.apple.rapportd _prefMaxConnectionCount 2>/dev/null || true
+          echo "Cleaned up."
