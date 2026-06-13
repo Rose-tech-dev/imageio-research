@@ -1,0 +1,119 @@
+name: iPhone Mirroring Deep Analysis
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deep:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Install tools
+        run: |
+          brew install blacktop/tap/ipsw
+          ipsw version
+
+      - name: Locate dyld cache and iPhone Mirroring binary
+        id: setup
+        run: |
+          CACHE="/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_arm64e"
+          echo "cache=$CACHE" >> $GITHUB_OUTPUT
+          APP="/System/Applications/iPhone Mirroring.app/Contents/MacOS/iPhone Mirroring"
+          echo "app=$APP" >> $GITHUB_OUTPUT
+          ls -la "$APP" 2>/dev/null || echo "App not at expected path"
+          find /System/Applications -name "iPhone*" 2>/dev/null
+
+      - name: Entitlements - iPhone Mirroring.app
+        run: |
+          APP="/System/Applications/iPhone Mirroring.app/Contents/MacOS/iPhone Mirroring"
+          echo "=== iPhone Mirroring.app ENTITLEMENTS ==="
+          codesign -d --entitlements :- "$APP" 2>/dev/null || true
+          echo ""
+          echo "=== ALL BINARIES IN iPhone Mirroring.app ==="
+          find "/System/Applications/iPhone Mirroring.app" -type f 2>/dev/null
+
+      - name: Find iPhone Mirroring XPC services and helpers
+        run: |
+          echo "=== XPC SERVICES IN iPhone Mirroring.app ==="
+          find "/System/Applications/iPhone Mirroring.app" -name "*.xpc" -o -name "*.appex" 2>/dev/null
+          echo ""
+          echo "=== ALL PLISTS IN iPhone Mirroring.app ==="
+          find "/System/Applications/iPhone Mirroring.app" -name "*.plist" 2>/dev/null | while read f; do
+            echo "--- $f ---"
+            plutil -p "$f" 2>/dev/null | head -30
+          done
+
+      - name: Find mirroringd daemon and all related daemons
+        run: |
+          echo "=== SEARCHING FOR MIRRORING DAEMON ==="
+          find /usr/libexec /System/Library -name "*mirror*" -o -name "*Mirror*" 2>/dev/null | grep -v ".icns\|.rb\|.ri\|.rst\|.go\|go\." | head -20
+          echo ""
+          echo "=== LAUNCH DAEMONS - iPhone/mirror specific ==="
+          grep -rl "iPhone\|PhoneMirror\|mirroringd\|phonelistener" \
+            /System/Library/LaunchDaemons \
+            /System/Library/LaunchAgents 2>/dev/null
+          echo ""
+          echo "=== ALL PLIST CONTENTS FOR MATCHES ==="
+          for f in $(grep -rl "iPhone\|PhoneMirror\|mirroringd" \
+            /System/Library/LaunchDaemons \
+            /System/Library/LaunchAgents 2>/dev/null | head -10); do
+            echo "=== $f ==="
+            plutil -p "$f" 2>/dev/null
+            echo ""
+          done
+
+      - name: Find Continuity and Handoff related daemons
+        run: |
+          echo "=== CONTINUITY RELATED DAEMONS ==="
+          find /usr/libexec /System/Library/CoreServices /System/Library/PrivateFrameworks \
+            -name "*continuity*" -o -name "*Continuity*" \
+            -o -name "*handoff*" -o -name "*Handoff*" \
+            -o -name "*phonelink*" -o -name "*PhoneLink*" \
+            2>/dev/null | grep -v ".strings\|.nib\|.car\|.icns" | head -30
+          echo ""
+          echo "=== LAUNCH AGENTS WITH continuity/handoff ==="
+          grep -rl "continuity\|Continuity\|handoff\|Handoff\|phonelink\|coreBridgeAgent" \
+            /System/Library/LaunchDaemons \
+            /System/Library/LaunchAgents 2>/dev/null | head -15
+
+      - name: Obj-C class list for iPhone Mirroring.app
+        run: |
+          APP="/System/Applications/iPhone Mirroring.app/Contents/MacOS/iPhone Mirroring"
+          echo "=== OBJ-C CLASSES IN iPhone Mirroring.app ==="
+          ipsw dyld objc class \
+            "/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_arm64e" \
+            --image "$APP" 2>/dev/null | head -200 || true
+          echo ""
+          echo "=== STRINGS CONTAINING XPC/SESSION/AUTH/PAIR ==="
+          strings "$APP" 2>/dev/null | grep -iE "(xpc|session|auth|pair|trust|token|UUID|entitlement|daemon|service|port)" | sort -u | head -100 || true
+
+      - name: Look at CoreBridge - the continuity stack daemon
+        run: |
+          echo "=== COREBRIDGE / CONTINUITY STACK ==="
+          find /System/Library /usr/libexec -name "*coreBridge*" -o -name "*CoreBridge*" \
+            -o -name "*coreBridged*" 2>/dev/null | head -10
+          CB=$(find /usr/libexec -name "coreBridged" 2>/dev/null | head -1)
+          if [ -n "$CB" ]; then
+            echo "Found: $CB"
+            codesign -d --entitlements :- "$CB" 2>/dev/null
+          fi
+          echo ""
+          echo "=== STRINGS IN CoreBridge DAEMON ==="
+          if [ -n "$CB" ]; then
+            strings "$CB" 2>/dev/null | grep -iE "(mirror|iphone|xpc|mach|service|trust|pair)" | sort -u | head -60
+          fi
+
+      - name: Look at the IOSurface / framebuffer sharing entitlements
+        run: |
+          APP="/System/Applications/iPhone Mirroring.app/Contents/MacOS/iPhone Mirroring"
+          echo "=== STRINGS - IOSurface, framebuffer, display ==="
+          strings "$APP" 2>/dev/null | grep -iE "(IOSurface|surface|framebuffer|screen|display|capture|metal|MTL)" | sort -u | head -60
+
+      - name: Save artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mirroring-deep-results
+          path: /tmp/
+          retention-days: 7
+          if-no-files-found: warn
