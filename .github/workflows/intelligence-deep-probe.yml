@@ -1,0 +1,304 @@
+name: Apple Intelligence Deep Probe (Gen 2)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'intelligenceplatformd_probe.swift'
+      - 'siriinferenced_probe.swift'
+      - '.github/workflows/intelligence-deep-probe.yml'
+
+jobs:
+  deep-probe:
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: System info
+        run: |
+          sw_vers
+          echo "XNU: $(uname -r)"
+          echo "SIP: $(csrutil status 2>/dev/null || echo unknown)"
+
+      # ── RECON: Extract real Mach service names from dyld cache ───────────
+      - name: Recon 1 - Find dyld cache and extract AI service names
+        run: |
+          echo "=== DYLD SHARED CACHE LOCATION ==="
+          ls -la /System/Library/dyld/ 2>/dev/null | head -10
+
+          echo ""
+          echo "=== STRINGS IN DYLD CACHE — WritingTools service names ==="
+          # Look for com.apple strings near "WritingTools" in the dyld cache
+          strings /System/Library/dyld/dyld_shared_cache_arm64e 2>/dev/null \
+            | grep -iE "writingtools|WritingTool" \
+            | grep "^com\.apple\." \
+            | sort -u | head -30 || echo "(not found or cache not readable)"
+
+          echo ""
+          echo "=== STRINGS IN DYLD CACHE — intelligence service names ==="
+          strings /System/Library/dyld/dyld_shared_cache_arm64e 2>/dev/null \
+            | grep -iE "intelligenceplatform|intelligenceflow|intelligencecontext" \
+            | grep "^com\.apple\." \
+            | sort -u | head -30 || echo "(none)"
+
+          echo ""
+          echo "=== STRINGS IN DYLD CACHE — siri service names ==="
+          strings /System/Library/dyld/dyld_shared_cache_arm64e 2>/dev/null \
+            | grep -iE "siriinfer|siri\.context|siriknow|siriaction" \
+            | grep "^com\.apple\." \
+            | sort -u | head -30 || echo "(none)"
+
+          echo ""
+          echo "=== STRINGS IN DYLD CACHE — privatecloudcompute ==="
+          strings /System/Library/dyld/dyld_shared_cache_arm64e 2>/dev/null \
+            | grep -iE "privatecloudcompute|pccservice|cloudcomputed" \
+            | grep "^com\.apple\." \
+            | sort -u | head -30 || echo "(none)"
+        continue-on-error: true
+
+      - name: Recon 2 - Extract service names from launchd plists
+        run: |
+          echo "=== intelligenceplatformd PLIST ==="
+          find /System/Library/LaunchDaemons /System/Library/LaunchAgents \
+            -name "*intelligenceplatform*" 2>/dev/null | while read f; do
+            echo "FILE: $f"
+            plutil -p "$f" 2>/dev/null | grep -E "MachServices|Label|ProgramArguments" | head -20
+          done
+
+          echo ""
+          echo "=== siriinferenced PLIST ==="
+          find /System/Library/LaunchDaemons /System/Library/LaunchAgents \
+            -name "*siriinferenced*" -o -name "*siriinference*" 2>/dev/null | while read f; do
+            echo "FILE: $f"
+            plutil -p "$f" 2>/dev/null | grep -E "MachServices|Label|ProgramArguments" | head -20
+          done
+
+          echo ""
+          echo "=== siri.context.service PLIST ==="
+          find /System/Library/LaunchDaemons /System/Library/LaunchAgents \
+            -name "*siri*context*" -o -name "*context.service*" 2>/dev/null | while read f; do
+            echo "FILE: $f"
+            plutil -p "$f" 2>/dev/null | head -30
+          done
+
+          echo ""
+          echo "=== WritingTools PLIST ==="
+          find /System/Library/LaunchDaemons /System/Library/LaunchAgents \
+            -name "*WritingTool*" -o -name "*writingtool*" 2>/dev/null | while read f; do
+            echo "FILE: $f"
+            plutil -p "$f" 2>/dev/null | head -30
+          done
+
+          echo ""
+          echo "=== ALL PLISTS WITH 'intelligence' IN MachServices KEY ==="
+          grep -rl "MachServices" /System/Library/LaunchDaemons/ \
+            /System/Library/LaunchAgents/ 2>/dev/null | while read f; do
+            if plutil -p "$f" 2>/dev/null | grep -q -i "intelligence\|writingtools\|siriinfer"; then
+              echo "FILE: $f"
+              plutil -p "$f" 2>/dev/null | grep -A5 -B1 "MachServices\|intelligence\|writingtools\|siriinfer" | head -30
+              echo "---"
+            fi
+          done
+        continue-on-error: true
+
+      - name: Recon 3 - Check privatecloudcomputed.app and ExtensionKit
+        run: |
+          echo "=== privatecloudcomputed.app ==="
+          PCC_APP="/System/Library/PrivateFrameworks/PrivateCloudCompute.framework/privatecloudcomputed.app"
+          if [ -d "$PCC_APP" ]; then
+            ls -la "$PCC_APP/Contents/" 2>/dev/null
+            ls -la "$PCC_APP/Contents/MacOS/" 2>/dev/null || echo "(no MacOS dir)"
+
+            echo "-- Info.plist --"
+            plutil -p "$PCC_APP/Contents/Info.plist" 2>/dev/null | head -40 || echo "(no Info.plist)"
+
+            echo "-- XPC Services --"
+            ls "$PCC_APP/Contents/XPCServices/" 2>/dev/null || echo "(no XPCServices)"
+
+            echo "-- strings: Mach service names --"
+            find "$PCC_APP" -type f -name "*.plist" 2>/dev/null | while read f; do
+              echo "PLIST: $f"
+              plutil -p "$f" 2>/dev/null | grep -iE "MachServices|com\.apple\." | head -10
+            done
+          else
+            echo "NOT FOUND: $PCC_APP"
+            find /System/Library/PrivateFrameworks/PrivateCloudCompute.framework \
+              -type f 2>/dev/null | head -20
+          fi
+
+          echo ""
+          echo "=== IntelligenceFlowAppIntentsExtension.appex ==="
+          APPEX="/System/Library/ExtensionKit/Extensions/IntelligenceFlowAppIntentsExtension.appex"
+          [ -d "$APPEX" ] && {
+            plutil -p "$APPEX/Contents/Info.plist" 2>/dev/null | head -40
+            strings "$APPEX/Contents/MacOS/"* 2>/dev/null | grep "^com\.apple\." | head -20 || true
+          } || echo "NOT FOUND: $APPEX"
+
+          echo ""
+          echo "=== ALL AppEX with intelligence/writing in name ==="
+          find /System/Library/ExtensionKit /System/Library -name "*.appex" \
+            2>/dev/null | grep -iE "intelligence|writingtools|siriinfer|pcc" | head -20
+        continue-on-error: true
+
+      - name: Recon 4 - Live process inspection of running intelligence daemons
+        run: |
+          echo "=== RUNNING PROCESSES WITH 'intelligence' OR 'siriinfer' ==="
+          ps aux | head -1
+          ps aux | grep -iE "intelligence|siriinfer|writingtools|privatecloudcompute" \
+            | grep -v grep | head -20
+
+          echo ""
+          echo "=== LSOF: Mach ports held by intelligenceplatformd ==="
+          IPID=$(pgrep -i "intelligenceplatformd" 2>/dev/null | head -1)
+          if [ -n "$IPID" ]; then
+            echo "intelligenceplatformd PID: $IPID"
+            lsof -p "$IPID" 2>/dev/null | grep -iE "mach|xpc|socket" | head -30 || echo "(lsof failed)"
+          else
+            echo "intelligenceplatformd not running (PID not found)"
+          fi
+
+          echo ""
+          echo "=== LSOF: Mach ports held by siriinferenced ==="
+          SIPID=$(pgrep -i "siriinferenced" 2>/dev/null | head -1)
+          if [ -n "$SIPID" ]; then
+            echo "siriinferenced PID: $SIPID"
+            lsof -p "$SIPID" 2>/dev/null | grep -iE "mach|xpc|socket" | head -30 || echo "(lsof failed)"
+          else
+            echo "siriinferenced not running"
+          fi
+
+          echo ""
+          echo "=== notifyutil: registered names containing 'intelligence' ==="
+          notifyutil -1 "com.apple.intelligence.status" 2>/dev/null || echo "(no notify)"
+
+          echo ""
+          echo "=== LAUNCHCTL PRINT for intelligenceplatformd ==="
+          launchctl print system/com.apple.intelligenceplatformd 2>/dev/null | head -40 \
+            || launchctl print gui/$(id -u)/com.apple.intelligenceplatformd 2>/dev/null | head -40 \
+            || echo "(not found in system or gui domain)"
+
+          echo ""
+          echo "=== LAUNCHCTL PRINT for siriinferenced ==="
+          launchctl print system/com.apple.siriinferenced 2>/dev/null | head -40 \
+            || launchctl print gui/$(id -u)/com.apple.siriinferenced 2>/dev/null | head -40 \
+            || echo "(not found)"
+        continue-on-error: true
+
+      # ── PROBES ──────────────────────────────────────────────────────────
+      - name: Probe 1 - intelligenceplatformd XPC
+        run: |
+          echo "=== Compiling intelligenceplatformd probe ==="
+          swiftc intelligenceplatformd_probe.swift -o /tmp/ip_probe 2>&1
+
+          echo ""
+          echo "=== Running intelligenceplatformd probe ==="
+          /tmp/ip_probe 2>&1
+        continue-on-error: true
+
+      - name: Probe 1 logs - intelligenceplatformd
+        run: |
+          echo "=== intelligenceplatformd logs (last 5min) ==="
+          log show \
+            --predicate 'process == "intelligenceplatformd" OR process CONTAINS "intelligence"' \
+            --last 5m --info --debug 2>/dev/null | head -150 || echo "(no logs)"
+        continue-on-error: true
+
+      - name: Probe 2 - siriinferenced + siri.context.service XPC
+        run: |
+          echo "=== Compiling siriinferenced probe ==="
+          swiftc siriinferenced_probe.swift -o /tmp/siri_probe 2>&1
+
+          echo ""
+          echo "=== Running siriinferenced probe ==="
+          /tmp/siri_probe 2>&1
+        continue-on-error: true
+
+      - name: Probe 2 logs - Siri daemons
+        run: |
+          echo "=== siriinferenced logs (last 5min) ==="
+          log show \
+            --predicate 'process == "siriinferenced" OR process == "siri.context.service" OR process == "siriknowledged" OR process == "siriactionsd"' \
+            --last 5m --info --debug 2>/dev/null | head -150 || echo "(no logs)"
+
+          echo ""
+          echo "=== intelligencecontextd logs ==="
+          log show \
+            --predicate 'process == "intelligencecontextd" OR process == "intelligenceflowd"' \
+            --last 5m --info 2>/dev/null | head -60 || echo "(no logs)"
+        continue-on-error: true
+
+      # ── BONUS: Probe WritingTools via UAF asset path ────────────────────
+      - name: Recon 5 - WritingTools UAF asset and model catalog
+        run: |
+          echo "=== UAF WritingTools plist ==="
+          plutil -p /System/Library/UnifiedAssetFramework/UsageAliases/com.apple.WritingTools.plist \
+            2>/dev/null | head -40 || echo "(not found)"
+
+          echo ""
+          echo "=== UAF AppleIntelligence plists ==="
+          for f in \
+            /System/Library/UnifiedAssetFramework/UsageAliases/com.apple.Settings.AppleIntelligence.plist \
+            /System/Library/UnifiedAssetFramework/UsageAliases/com.apple.Settings.AppleIntelligence.Diffusion.plist \
+            /System/Library/UnifiedAssetFramework/AssetSets/com.apple.modelcatalog.plist \
+            /System/Library/ModelManager/Policy.plist; do
+            [ -f "$f" ] && {
+              echo "FILE: $f"
+              plutil -p "$f" 2>/dev/null | head -40
+              echo "---"
+            }
+          done
+
+          echo ""
+          echo "=== OnBoarding Bundle for intelligenceengine ==="
+          BUNDLE="/System/Library/OnBoardingBundles/com.apple.onboarding.intelligenceengine.bundle"
+          [ -d "$BUNDLE" ] && {
+            ls -la "$BUNDLE/Contents/" 2>/dev/null
+            find "$BUNDLE" -name "*.plist" 2>/dev/null | while read f; do
+              echo "PLIST: $f"
+              plutil -p "$f" 2>/dev/null | head -30
+            done
+          } || echo "(not found)"
+
+          echo ""
+          echo "=== AppIntents Daemons plist ==="
+          plutil -p /System/Library/AppIntents/Daemons/legacy-daemons.plist 2>/dev/null \
+            | head -50 || echo "(not found)"
+        continue-on-error: true
+
+      - name: Probe 3 - WritingTools via actual plist-discovered service name
+        run: |
+          echo "=== Attempt to extract WritingTools Mach service from UAF ==="
+          # The UAF plist might contain the XPC service name or daemon label
+          grep -r "com.apple" \
+            /System/Library/UnifiedAssetFramework/UsageAliases/com.apple.WritingTools.plist \
+            2>/dev/null | head -20 || true
+
+          echo ""
+          echo "=== strings in WritingToolsUI framework ==="
+          find /System/Library/PrivateFrameworks/WritingToolsUI.framework -type f 2>/dev/null \
+            | while read f; do
+            echo "FILE: $f"
+            strings "$f" 2>/dev/null | grep "^com\.apple\." | grep -iE "writing|tool|xpc|service|daemon" | head -20
+          done || echo "(no files)"
+
+          echo ""
+          echo "=== ALL strings mentioning 'writingtools' in /System/Library ==="
+          find /System/Library -name "*.plist" -newer /System/Library/Frameworks/Foundation.framework 2>/dev/null \
+            | xargs grep -li "writingtools\|WritingTool" 2>/dev/null | head -10 | while read f; do
+            echo "FILE: $f"
+            grep -i "writingtools\|WritingTool\|com.apple" "$f" 2>/dev/null | head -10
+          done || true
+        continue-on-error: true
+
+      - name: Summary - confirmed findings
+        run: |
+          echo "=== GEN 2 PROBE SUMMARY ==="
+          echo "Target: macOS $(sw_vers -productVersion) ($(sw_vers -buildVersion))"
+          echo ""
+          echo "Services confirmed running on this system:"
+          launchctl list | grep -E "intelligenceplatformd|siriinferenced|siri\.context|siriknowledged|siriactionsd|intelligenceflowd|intelligencecontextd" | sort
+          echo ""
+          echo "Probe results (search for TIMEOUT or REPLY above for any accepted calls)"
