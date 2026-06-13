@@ -84,9 +84,10 @@ func probe(label: String, waitSeconds: Int = 6,
 print("=== rapportd Non-Nil Argument / Class Whitelist Probe ===")
 print("PID: \(ProcessInfo.processInfo.processIdentifier)  UID: \(getuid())\n")
 
-// 1. NSObject — not in whitelist, expect INTERRUPTED
-probe(label: "remoteDisplayChangeDedicatedDevice:(NSObject()) — whitelist test") { p, sema in
-    p.remoteDisplayChangeDedicatedDevice?(NSObject())
+// 1. NSNumber — conforms to NSSecureCoding; NOT in RPRemoteDisplayDevice whitelist.
+//    NSObject() was removed — it crashes NSXPCEncoder (no NSSecureCoding conformance).
+probe(label: "remoteDisplayChangeDedicatedDevice:(NSNumber 42) — wrong class, NSSecureCoding OK") { p, sema in
+    p.remoteDisplayChangeDedicatedDevice?(NSNumber(value: 42))
     DispatchQueue.global().asyncAfter(deadline: .now() + 5) { sema.signal() }
 }
 
