@@ -1,4 +1,4 @@
-name: rapportd Preference Bypass Probe
+name: rapportd Pref Bypass Probe
 
 on:
   workflow_dispatch:
