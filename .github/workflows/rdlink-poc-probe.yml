@@ -8,47 +8,66 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 15
     steps:
-      - name: Setup Python listener and Bonjour advertisement
+      - name: Write listener script
         run: |
-          pip3 install zeroconf 2>/dev/null | tail -1 || true
-
-          # Start a TCP listener on port 9999 that captures all incoming data
-          python3 -c "
-import socket, threading, time, struct, sys
+          cat > /tmp/listener.py << 'PYEOF'
+import socket
+import threading
+import time
+import subprocess
+import sys
 
 received_data = []
-connections = []
+connections_seen = []
+
+def hex_dump(data, prefix='  '):
+    for i in range(0, len(data), 16):
+        chunk = data[i:i+16]
+        hex_part = ' '.join('%02x' % b for b in chunk)
+        ascii_part = ''.join(chr(b) if 32 <= b < 127 else '.' for b in chunk)
+        print('%s%04x: %-48s  %s' % (prefix, i, hex_part, ascii_part))
 
 def handle_conn(conn, addr):
-    print(f'[+] Connection from {addr}', flush=True)
-    connections.append((conn, addr))
+    print('[+] TCP connection from %s:%d' % addr, flush=True)
+    connections_seen.append(addr)
     try:
-        conn.settimeout(5)
-        while True:
-            data = conn.recv(4096)
-            if not data:
-                break
-            print(f'[+] Received {len(data)} bytes from {addr}:', flush=True)
-            # Print hex dump
-            for i in range(0, len(data), 16):
-                chunk = data[i:i+16]
-                hex_part = ' '.join(f'{b:02x}' for b in chunk)
-                ascii_part = ''.join(chr(b) if 32 <= b < 127 else '.' for b in chunk)
-                print(f'  {i:04x}: {hex_part:<48}  {ascii_part}', flush=True)
-            received_data.append(data)
+        conn.settimeout(8)
+        data = conn.recv(8192)
+        if data:
+            print('[+] Received %d bytes initial data:' % len(data), flush=True)
+            hex_dump(data)
+            received_data.append(('tcp', addr, data))
+            # Send malformed frame: claim 0xFFFFFF bytes but only send 4
+            malformed = bytes([0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x00, 0x00, 0x00])
+            conn.sendall(malformed)
+            print('[+] Sent malformed oversized-length frame', flush=True)
+            time.sleep(3)
+            resp = conn.recv(4096)
+            if resp:
+                print('[+] Response after malformed frame: %d bytes' % len(resp), flush=True)
+                hex_dump(resp)
     except Exception as e:
-        print(f'[+] Connection ended: {e}', flush=True)
+        print('[+] Connection ended: %s' % e, flush=True)
     finally:
         conn.close()
 
 srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 srv.bind(('0.0.0.0', 9999))
-srv.listen(5)
+srv.listen(10)
 srv.settimeout(1)
-print(f'[+] Listening on port 9999', flush=True)
+print('[+] TCP listener on port 9999', flush=True)
 
-end_time = time.time() + 30
+# Advertise _rdlink._tcp
+dns1 = subprocess.Popen(['dns-sd', '-R', 'TestRapportMirror', '_rdlink._tcp', 'local', '9999', 'rpfl=0', 'rpld=0'])
+# Also try _companion-link._tcp
+dns2 = subprocess.Popen(['dns-sd', '-R', 'TestCompLink', '_companion-link._tcp', 'local', '9999', 'rpfl=0'])
+# And _identityservice._tcp
+dns3 = subprocess.Popen(['dns-sd', '-R', 'TestIdentSvc', '_identityservice._tcp', 'local', '9999'])
+
+print('[+] Advertising _rdlink._tcp, _companion-link._tcp, _identityservice._tcp on port 9999', flush=True)
+
+end_time = time.time() + 35
 while time.time() < end_time:
     try:
         conn, addr = srv.accept()
@@ -58,166 +77,88 @@ while time.time() < end_time:
     except socket.timeout:
         pass
 
-print(f'[+] Done. Total connections: {len(connections)}, Total data received: {sum(len(d) for d in received_data)} bytes', flush=True)
-if received_data:
-    print('[+] PROTO FRAMES CAPTURED - rapportd connected to us!', flush=True)
+dns1.terminate()
+dns2.terminate()
+dns3.terminate()
+srv.close()
+
+print('', flush=True)
+print('=== RESULTS ===', flush=True)
+print('Total connections: %d' % len(connections_seen), flush=True)
+print('Total data received: %d bytes' % sum(len(d[2]) for d in received_data), flush=True)
+if connections_seen:
+    print('SUCCESS: rapportd (or another process) connected to our service!', flush=True)
+    for svc, addr, data in received_data:
+        print('  From %s:%d - %d bytes' % (addr[0], addr[1], len(data)), flush=True)
 else:
-    print('[-] No data received - rapportd did not connect', flush=True)
-" &
-          LISTENER_PID=$!
+    print('No connections - rapportd requires paired device or different trigger', flush=True)
+PYEOF
+          echo "Listener script written to /tmp/listener.py"
 
-          sleep 2
-
-          echo "=== CURRENT HOST IP ==="
-          ipconfig getifaddr en0 2>/dev/null || ifconfig en0 | grep "inet " | awk '{print $2}'
-
-          echo ""
-          echo "=== ADVERTISING _rdlink._tcp on port 9999 ==="
-          # Use dns-sd to advertise the service
-          dns-sd -R "TestRapportDevice" _rdlink._tcp local 9999 "rpfl=0" &
-          DNS_PID=$!
-          echo "dns-sd PID: $DNS_PID"
-
-          echo ""
-          echo "=== ALSO ADVERTISING _companion-link._tcp ==="
-          dns-sd -R "TestCompanion" _companion-link._tcp local 9999 "rpfl=0" &
-          DNS_PID2=$!
-
-          echo ""
-          echo "=== WAITING 25 SECONDS FOR rapportd TO CONNECT ==="
-          sleep 25
-
-          kill $DNS_PID $DNS_PID2 2>/dev/null || true
-          wait $LISTENER_PID 2>/dev/null || true
-
-      - name: Check if rapportd tried to connect - system logs
+      - name: Run probe and capture rapportd behavior
         run: |
-          echo "=== rapportd LOGS (last 60 seconds) ==="
-          log show --predicate 'process == "rapportd"' --last 1m 2>/dev/null | grep -iE "(rdlink|remote.display|bonjour|connect|unauth|found.device|TestRapport)" | head -50 || true
-
+          echo "=== SYSTEM INFO ==="
+          sw_vers
           echo ""
-          echo "=== NETWORK CONNECTIONS BY rapportd ==="
-          lsof -p $(pgrep rapportd 2>/dev/null | head -1) -i 2>/dev/null | grep -i "9999\|LISTEN\|ESTABLISHED" | head -20 || true
-
+          echo "=== rapportd PID ==="
+          pgrep rapportd || echo "rapportd not running"
           echo ""
-          echo "=== ALL RAPPORTD PROCESS INFO ==="
-          pgrep -la rapportd 2>/dev/null || true
-          ps aux | grep rapportd | grep -v grep | head -5
+          echo "=== LOCAL IP ==="
+          ipconfig getifaddr en0 2>/dev/null || echo "no en0"
+          echo ""
+          echo "=== STARTING PROBE ==="
+          python3 /tmp/listener.py 2>&1
 
-      - name: Advertise _identityservice._tcp and capture response
+      - name: Check rapportd system logs
         run: |
-          python3 -c "
-import socket, threading, time
+          echo "=== rapportd RECENT LOGS ==="
+          log show --predicate 'process == "rapportd"' --last 2m 2>/dev/null | grep -iE "(rdlink|remote.display|bonjour|connect|unauth|found|Test|9999)" | head -60 || true
 
-received = []
+          echo ""
+          echo "=== mDNSResponder LOGS (Bonjour browsing) ==="
+          log show --predicate 'process == "mDNSResponder"' --last 2m 2>/dev/null | grep -iE "(rdlink|TestRapport|TestCompLink|TestIdentSvc)" | head -30 || true
 
-def handle(conn, addr):
-    print(f'[IDENTITY] Connection from {addr}')
-    try:
-        conn.settimeout(8)
-        data = conn.recv(8192)
-        if data:
-            print(f'[IDENTITY] Got {len(data)} bytes:')
-            for i in range(0, len(data), 16):
-                chunk = data[i:i+16]
-                hex_p = ' '.join(f'{b:02x}' for b in chunk)
-                asc_p = ''.join(chr(b) if 32<=b<127 else '.' for b in chunk)
-                print(f'  {i:04x}: {hex_p:<48}  {asc_p}')
-            received.append(data)
-            # Try sending a malformed frame back
-            # Claim 4GB frame, send only 4 bytes payload
-            malformed = bytes([0xFF,0xFF,0xFF,0xFF, 0x01, 0x00, 0x00, 0x00])
-            conn.send(malformed)
-            print('[IDENTITY] Sent malformed frame')
-            time.sleep(2)
-            data2 = conn.recv(4096)
-            if data2:
-                print(f'[IDENTITY] Response after malformed: {len(data2)} bytes')
-                for i in range(0, len(data2), 16):
-                    chunk = data2[i:i+16]
-                    print(f'  {i:04x}: {\" \".join(f\"{b:02x}\" for b in chunk)}')
-    except Exception as e:
-        print(f'[IDENTITY] Error: {e}')
-    finally:
-        conn.close()
+          echo ""
+          echo "=== BROWSE FOR rdlink SERVICES ==="
+          timeout 8 dns-sd -B _rdlink._tcp local 2>/dev/null || true
 
-srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-srv.bind(('0.0.0.0', 9998))
-srv.listen(5)
-srv.settimeout(1)
-print('[IDENTITY] Listener on 9998')
+          echo ""
+          echo "=== BROWSE FOR companion-link ==="
+          timeout 8 dns-sd -B _companion-link._tcp local 2>/dev/null || true
 
+      - name: QUIC UDP probe for _asquic._udp
+        run: |
+          cat > /tmp/quic_probe.py << 'PYEOF'
+import socket
 import subprocess
-dns = subprocess.Popen(['dns-sd', '-R', 'TestIdentSvc', '_identityservice._tcp', 'local', '9998'])
+import time
 
-end = time.time() + 30
-while time.time() < end:
-    try:
-        conn, addr = srv.accept()
-        threading.Thread(target=handle, args=(conn,addr), daemon=True).start()
-    except socket.timeout:
-        pass
-
-dns.terminate()
-print(f'Total received: {sum(len(d) for d in received)} bytes')
-if received:
-    print('SUCCESS: rapportd connected to _identityservice._tcp!')
-" 2>&1
-
-      - name: Browse for actual _rdlink._tcp services in environment
-        run: |
-          echo "=== BROWSE FOR _rdlink._tcp ON LOCAL NET ==="
-          timeout 10 dns-sd -B _rdlink._tcp local 2>/dev/null || true
-
-          echo ""
-          echo "=== BROWSE FOR _companion-link._tcp ==="
-          timeout 10 dns-sd -B _companion-link._tcp local 2>/dev/null || true
-
-          echo ""
-          echo "=== BROWSE FOR _identityservice._tcp ==="
-          timeout 10 dns-sd -B _identityservice._tcp local 2>/dev/null || true
-
-          echo ""
-          echo "=== rapportd MACH PORTS (what it's registered for) ==="
-          launchctl list com.apple.rapportd 2>/dev/null | head -20 || true
-
-          echo ""
-          echo "=== rapportd BONJOUR REGISTRATIONS (from lsof) ==="
-          # Check if rapportd has any mDNSResponder registrations
-          lsof -p $(pgrep rapportd | head -1) 2>/dev/null | grep -i "mDNS\|bonjour\|mdns" | head -20 || true
-
-      - name: Probe _asquic._udp (Apple QUIC transport)
-        run: |
-          echo "=== _asquic._udp PROBE ==="
-          # Set up UDP listener and advertise the QUIC service
-          python3 -c "
-import socket, time, subprocess
-
-# Listen for incoming QUIC Initial packets
 srv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 srv.bind(('0.0.0.0', 9997))
 srv.settimeout(1)
 
-dns = subprocess.Popen(['dns-sd', '-R', 'TestQUIC', '_asquic._udp', 'local', '9997'])
-print('[QUIC] Listening on UDP 9997')
+dns = subprocess.Popen(['dns-sd', '-R', 'TestQUICSvc', '_asquic._udp', 'local', '9997'])
+print('[QUIC] Listening on UDP 9997, advertising _asquic._udp', flush=True)
 
-end = time.time() + 20
 packets = []
-while time.time() < end:
+end_time = time.time() + 20
+while time.time() < end_time:
     try:
         data, addr = srv.recvfrom(65535)
-        print(f'[QUIC] Got UDP packet from {addr}: {len(data)} bytes')
-        for i in range(0, min(len(data), 64), 16):
+        print('[QUIC] Got UDP packet from %s:%d - %d bytes' % (addr[0], addr[1], len(data)), flush=True)
+        for i in range(0, min(len(data), 128), 16):
             chunk = data[i:i+16]
-            print(f'  {i:04x}: {\" \".join(f\"{b:02x}\" for b in chunk)}')
+            print('  %04x: %s' % (i, ' '.join('%02x' % b for b in chunk)), flush=True)
         packets.append((data, addr))
     except socket.timeout:
         pass
 
 dns.terminate()
-print(f'[QUIC] Total packets: {len(packets)}')
+print('[QUIC] Total packets: %d' % len(packets), flush=True)
 if packets:
-    print('[QUIC] SUCCESS - rapportd sent QUIC Initial packet!')
-" 2>&1
+    print('[QUIC] SUCCESS - rapportd/wifip2pd sent QUIC Initial packet to us!', flush=True)
+else:
+    print('[QUIC] No QUIC packets received', flush=True)
+PYEOF
+          python3 /tmp/quic_probe.py 2>&1
