@@ -1,0 +1,278 @@
+name: Apple Intelligence XPC Probe
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'discover_ai_daemons.sh'
+      - 'writingtools_xpc_probe.swift'
+      - 'notification_intelligence_probe.swift'
+      - '.github/workflows/apple-intelligence-probe.yml'
+
+jobs:
+  discover-and-probe:
+    runs-on: macos-15
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: macOS version info
+        run: |
+          sw_vers
+          uname -a
+          system_profiler SPSoftwareDataType | head -20
+
+      # ── STAGE 1: DISCOVERY ──────────────────────────────────────────────
+      - name: Stage 1 - Discover Apple Intelligence daemons
+        run: |
+          chmod +x discover_ai_daemons.sh
+          bash discover_ai_daemons.sh 2>&1
+        continue-on-error: true
+
+      # ── STAGE 1b: Deep binary search for new daemons ────────────────────
+      - name: Stage 1b - Find AI frameworks and XPC service names
+        run: |
+          echo "=== FIND ALL PRIVATE FRAMEWORKS WITH 'intelligence' OR 'writing' ==="
+          find /System/Library/PrivateFrameworks /System/Library/Frameworks \
+            -maxdepth 3 -name "*.framework" \
+            | grep -iE "intelligence|writing|genmoji|imageplay|airuntime|foundationmodel|privatecloudcompute|siriinfer|narrativeui|adaptive" \
+            | sort
+
+          echo ""
+          echo "=== CHECK WRITING TOOLS FRAMEWORK SPECIFICALLY ==="
+          ls -la /System/Library/PrivateFrameworks/WritingTools.framework 2>/dev/null \
+            || echo "NOT FOUND: WritingTools.framework (private)"
+          ls -la /System/Library/Frameworks/WritingTools.framework 2>/dev/null \
+            || echo "NOT FOUND: WritingTools.framework (public)"
+
+          echo ""
+          echo "=== CHECK INTELLIGENCE / APPLEINTELLIGENCE FRAMEWORKS ==="
+          for fw in Intelligence AppleIntelligence AIRuntime NarrativeUI AdaptiveInference \
+                    FoundationModels SiriInference NotificationIntelligence \
+                    ImagePlayground Genmoji PrivateCloudCompute; do
+            path="/System/Library/PrivateFrameworks/${fw}.framework"
+            if [ -d "$path" ]; then
+              echo "EXISTS: $path"
+              ls "$path/" 2>/dev/null
+            else
+              echo "MISSING: $path"
+            fi
+          done
+
+          echo ""
+          echo "=== STRINGS: MACH SERVICES IN /usr/libexec BINARIES ==="
+          for bin in /usr/libexec/*intelligence* /usr/libexec/*writing* \
+                     /usr/libexec/*genmoji* /usr/libexec/*imageplay* \
+                     /usr/libexec/*airuntime* /usr/libexec/*appleintelligence* \
+                     /usr/libexec/*pccservice* /usr/libexec/*assistantd* \
+                     /usr/libexec/*siriinfer*; do
+            [ -f "$bin" ] && {
+              echo "--- $bin ---"
+              strings "$bin" | grep "^com\.apple\." | head -30
+            }
+          done
+
+          echo ""
+          echo "=== LAUNCHCTL LIST — FILTER FOR INTELLIGENCE/WRITING ==="
+          launchctl list | grep -iE "intelligence|writing|genmoji|imageplay|airuntime|pcc|siriinfer|foundationmodel|appleintelligence|narrativeui" \
+            || echo "(no matching services registered)"
+
+          echo ""
+          echo "=== ALL LOADED DAEMONS (launchctl list, sorted) ==="
+          launchctl list | sort -k3 | grep "com.apple" | head -150
+        continue-on-error: true
+
+      # ── STAGE 1c: Extract actual XPC method names ────────────────────────
+      - name: Stage 1c - Extract ObjC selectors from AI daemon binaries
+        run: |
+          echo "=== OBJC METHOD EXTRACTION FROM AI FRAMEWORKS ==="
+
+          for fw_dir in \
+            /System/Library/PrivateFrameworks/Intelligence.framework \
+            /System/Library/PrivateFrameworks/AppleIntelligence.framework \
+            /System/Library/PrivateFrameworks/WritingTools.framework \
+            /System/Library/PrivateFrameworks/AIRuntime.framework \
+            /System/Library/PrivateFrameworks/NotificationIntelligence.framework \
+            /System/Library/PrivateFrameworks/SiriInference.framework \
+            /System/Library/PrivateFrameworks/FoundationModels.framework \
+            /System/Library/PrivateFrameworks/ImagePlayground.framework \
+            /System/Library/PrivateFrameworks/Genmoji.framework \
+            /System/Library/PrivateFrameworks/PrivateCloudCompute.framework \
+            /System/Library/Frameworks/WritingTools.framework; do
+
+            [ -d "$fw_dir" ] || continue
+            echo ""
+            echo "=== $fw_dir ==="
+            main_bin=$(basename "${fw_dir%.framework}")
+            bin_path="$fw_dir/$main_bin"
+            [ -f "$bin_path" ] || { echo "Binary not found at $bin_path"; continue; }
+
+            echo "Binary: $bin_path ($(file "$bin_path" | cut -d: -f2))"
+            echo "Size: $(wc -c < "$bin_path") bytes"
+
+            echo "-- Entitlements --"
+            codesign -d --entitlements - "$bin_path" 2>/dev/null | grep -oE "com\.apple\.[a-zA-Z0-9._-]+" | sort -u | head -30 \
+              || echo "(no entitlements or stub binary)"
+
+            echo "-- ObjC XPC-related methods --"
+            strings "$bin_path" 2>/dev/null \
+              | grep -E "^[a-z][a-zA-Z0-9]+:.*[a-z]" \
+              | grep -iE "xpc|request|session|connection|service|proxy|remote|process|rewrite|summar|priorit|classif|notif|suggest|complet|generat" \
+              | head -40 || echo "(no matching selectors in strings)"
+
+            echo "-- com.apple Mach service names --"
+            strings "$bin_path" 2>/dev/null | grep "^com\.apple\." | grep -v "Copyright\|apple\.com\|identifier" | head -30
+          done
+
+          echo ""
+          echo "=== /usr/libexec — ALL BINARIES SORTED BY DATE ==="
+          ls -lt /usr/libexec/ | head -50
+
+          echo ""
+          echo "=== STRINGS: ALL com.apple XPC SERVICES IN assistantd ==="
+          [ -f /usr/libexec/assistantd ] && \
+            strings /usr/libexec/assistantd | grep "^com\.apple\." | sort | head -60
+
+          echo ""
+          echo "=== appleintelligenced IF EXISTS ==="
+          for bin in /usr/libexec/appleintelligenced /usr/libexec/intelligenced \
+                     /usr/libexec/AIRuntimed /usr/libexec/writingtoolsd; do
+            [ -f "$bin" ] && {
+              echo "FOUND: $bin"
+              strings "$bin" | grep "^com\.apple\." | head -30
+              codesign -d --entitlements - "$bin" 2>/dev/null | grep "com.apple.private" | head -20
+            }
+          done
+        continue-on-error: true
+
+      # ── STAGE 2: Writing Tools XPC Probe ────────────────────────────────
+      - name: Stage 2 - Compile and run Writing Tools probe
+        run: |
+          echo "=== Compiling Writing Tools probe ==="
+          swiftc writingtools_xpc_probe.swift -o /tmp/writingtools_probe 2>&1
+
+          echo ""
+          echo "=== Running Writing Tools probe ==="
+          /tmp/writingtools_probe 2>&1
+        continue-on-error: true
+
+      - name: Stage 2 log capture - Writing Tools daemon logs
+        run: |
+          echo "=== System log: Writing Tools / Intelligence daemons (last 5min) ==="
+          log show \
+            --predicate 'process CONTAINS[c] "writingtools" OR process CONTAINS[c] "intelligence" OR process CONTAINS[c] "assistantd" OR process CONTAINS[c] "genmoji" OR process CONTAINS[c] "imageplay" OR process CONTAINS[c] "airuntime"' \
+            --last 5m \
+            --info \
+            --debug 2>/dev/null | head -200 || echo "(no logs)"
+        continue-on-error: true
+
+      # ── STAGE 3: Notification Intelligence Probe ─────────────────────────
+      - name: Stage 3 - Compile and run Notification Intelligence probe
+        run: |
+          echo "=== Compiling Notification Intelligence probe ==="
+          swiftc notification_intelligence_probe.swift -o /tmp/notif_intelligence_probe 2>&1
+
+          echo ""
+          echo "=== Running Notification Intelligence probe ==="
+          /tmp/notif_intelligence_probe 2>&1
+        continue-on-error: true
+
+      - name: Stage 3 log capture - Notification Intelligence logs
+        run: |
+          echo "=== System log: Notification Intelligence (last 5min) ==="
+          log show \
+            --predicate 'process CONTAINS[c] "notification" AND (process CONTAINS[c] "intelligence" OR process CONTAINS[c] "priority")' \
+            --last 5m \
+            --info \
+            --debug 2>/dev/null | head -100 || echo "(no logs)"
+
+          echo ""
+          echo "=== UNUserNotificationCenter daemon logs ==="
+          log show \
+            --predicate 'process == "UserNotificationCenter" OR process == "notificationd" OR process == "usernoted"' \
+            --last 3m \
+            --info 2>/dev/null | head -100 || echo "(no logs)"
+        continue-on-error: true
+
+      # ── STAGE 4: App Intents / SiriKit XPC enumeration ──────────────────
+      - name: Stage 4 - App Intents and SiriKit XPC enumeration
+        run: |
+          echo "=== App Intents framework XPC services ==="
+          for fw in AppIntents SiriKit SiriIntents IntentsUI; do
+            path="/System/Library/Frameworks/${fw}.framework"
+            [ -d "$path" ] || path="/System/Library/PrivateFrameworks/${fw}.framework"
+            [ -d "$path" ] && {
+              echo "FOUND: $path"
+              bin="$path/$fw"
+              [ -f "$bin" ] && strings "$bin" | grep "^com\.apple\." | head -20
+            } || echo "NOT FOUND: $fw.framework"
+          done
+
+          echo ""
+          echo "=== All XPC services related to Siri/Intents in launchctl ==="
+          launchctl list | grep -iE "siri|intent|appintent|shortcut" | sort | head -30 || echo "(none)"
+
+          echo ""
+          echo "=== assistantd XPC interface methods ==="
+          [ -f /usr/libexec/assistantd ] && {
+            echo "assistantd exists: $(wc -c < /usr/libexec/assistantd) bytes"
+            strings /usr/libexec/assistantd \
+              | grep -E "^[a-z][a-zA-Z0-9]+:.*[a-zA-Z]" \
+              | grep -iE "xpc|remote|service|session|request|response|connection|proxy|handler|process" \
+              | head -50
+            echo "--- com.apple services in assistantd ---"
+            strings /usr/libexec/assistantd | grep "^com\.apple\." | sort | head -50
+          } || echo "assistantd not found at /usr/libexec/assistantd"
+        continue-on-error: true
+
+      # ── STAGE 5: EU feature flag and regional code path recon ────────────
+      - name: Stage 5 - EU feature flags and regional gating
+        run: |
+          echo "=== Device region / locale ==="
+          defaults read /Library/Preferences/.GlobalPreferences.plist AppleLocale 2>/dev/null || true
+          defaults read /Library/Preferences/.GlobalPreferences.plist AppleLanguages 2>/dev/null || true
+
+          echo ""
+          echo "=== Apple Intelligence feature flags (plists) ==="
+          find /System/Library /Library/Preferences -name "*.plist" \
+            | xargs grep -l "intelligence\|WritingTools\|AppleIntelligence" 2>/dev/null \
+            | head -20
+
+          echo ""
+          echo "=== Software Update / build train (beta indicator) ==="
+          defaults read /Library/Preferences/com.apple.SoftwareUpdate 2>/dev/null | head -20 || true
+          sw_vers
+
+          echo ""
+          echo "=== OTA assets indicating Apple Intelligence build ==="
+          ls /System/Library/AssetsV2/ 2>/dev/null | grep -iE "intelligence|airuntime|writing" | head -20 || echo "(none)"
+          ls /Library/Apple/System/Library/AssetsV2/ 2>/dev/null | grep -iE "intelligence|airuntime|writing" | head -20 || echo "(none)"
+        continue-on-error: true
+
+      # ── Final: Summarize what was found ──────────────────────────────────
+      - name: Summary - What AI services exist on this runner
+        run: |
+          echo "=== SUMMARY: APPLE INTELLIGENCE ON macOS $(sw_vers -productVersion) ==="
+          echo ""
+          echo "Frameworks present:"
+          for fw in Intelligence AppleIntelligence WritingTools AIRuntime NotificationIntelligence \
+                    SiriInference FoundationModels ImagePlayground Genmoji PrivateCloudCompute \
+                    NarrativeUI AdaptiveInference; do
+            priv="/System/Library/PrivateFrameworks/${fw}.framework"
+            pub="/System/Library/Frameworks/${fw}.framework"
+            [ -d "$priv" ] && echo "  PRESENT (private): $priv" || \
+            [ -d "$pub"  ] && echo "  PRESENT (public):  $pub"  || \
+            echo "  ABSENT:  $fw.framework"
+          done
+
+          echo ""
+          echo "Daemons in /usr/libexec (AI-related):"
+          ls /usr/libexec/ | grep -iE "intelligence|writing|genmoji|imageplay|airuntime|assistantd|pccservice|siriinfer|foundationmodel|appleintelligence|narrativeui" \
+            || echo "  (none matching)"
+
+          echo ""
+          echo "Active XPC services (launchctl):"
+          launchctl list | grep -iE "intelligence|writing|genmoji|imageplay|airuntime|pcc|siriinfer|foundationmodel|narrativeui" \
+            || echo "  (none matching)"
