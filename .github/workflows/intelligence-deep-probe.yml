@@ -144,47 +144,40 @@ jobs:
         continue-on-error: true
 
       - name: Recon 4 - Live process inspection of running intelligence daemons
+        timeout-minutes: 3
         run: |
           echo "=== RUNNING PROCESSES WITH 'intelligence' OR 'siriinfer' ==="
-          ps aux | head -1
           ps aux | grep -iE "intelligence|siriinfer|writingtools|privatecloudcompute" \
-            | grep -v grep | head -20
+            | grep -v grep | head -20 || echo "(none)"
 
           echo ""
-          echo "=== LSOF: Mach ports held by intelligenceplatformd ==="
-          IPID=$(pgrep -i "intelligenceplatformd" 2>/dev/null | head -1)
-          if [ -n "$IPID" ]; then
-            echo "intelligenceplatformd PID: $IPID"
-            lsof -p "$IPID" 2>/dev/null | grep -iE "mach|xpc|socket" | head -30 || echo "(lsof failed)"
-          else
-            echo "intelligenceplatformd not running (PID not found)"
-          fi
+          echo "=== intelligenceplatformd process details ==="
+          IPID=$(pgrep -x "intelligenceplatformd" 2>/dev/null || pgrep -f "intelligenceplatformd" 2>/dev/null | head -1)
+          echo "PID: ${IPID:-(not found)}"
+          [ -n "$IPID" ] && ps -p "$IPID" -o pid,ppid,user,%cpu,%mem,command 2>/dev/null || true
 
           echo ""
-          echo "=== LSOF: Mach ports held by siriinferenced ==="
-          SIPID=$(pgrep -i "siriinferenced" 2>/dev/null | head -1)
-          if [ -n "$SIPID" ]; then
-            echo "siriinferenced PID: $SIPID"
-            lsof -p "$SIPID" 2>/dev/null | grep -iE "mach|xpc|socket" | head -30 || echo "(lsof failed)"
-          else
-            echo "siriinferenced not running"
-          fi
+          echo "=== siriinferenced process details ==="
+          SIPID=$(pgrep -x "siriinferenced" 2>/dev/null || pgrep -f "siriinferenced" 2>/dev/null | head -1)
+          echo "PID: ${SIPID:-(not found)}"
+          [ -n "$SIPID" ] && ps -p "$SIPID" -o pid,ppid,user,%cpu,%mem,command 2>/dev/null || true
 
           echo ""
-          echo "=== notifyutil: registered names containing 'intelligence' ==="
-          notifyutil -1 "com.apple.intelligence.status" 2>/dev/null || echo "(no notify)"
+          echo "=== LAUNCHCTL PRINT for intelligenceplatformd (10s timeout) ==="
+          timeout 10 launchctl print gui/$(id -u)/com.apple.intelligenceplatformd 2>/dev/null \
+            | grep -E "MachServices|path|pid|state|label" | head -20 \
+            || echo "(not in gui domain or timed out)"
 
           echo ""
-          echo "=== LAUNCHCTL PRINT for intelligenceplatformd ==="
-          launchctl print system/com.apple.intelligenceplatformd 2>/dev/null | head -40 \
-            || launchctl print gui/$(id -u)/com.apple.intelligenceplatformd 2>/dev/null | head -40 \
-            || echo "(not found in system or gui domain)"
+          echo "=== LAUNCHCTL PRINT for siriinferenced (10s timeout) ==="
+          timeout 10 launchctl print gui/$(id -u)/com.apple.siriinferenced 2>/dev/null \
+            | grep -E "MachServices|path|pid|state|label" | head -20 \
+            || echo "(not in gui domain or timed out)"
 
           echo ""
-          echo "=== LAUNCHCTL PRINT for siriinferenced ==="
-          launchctl print system/com.apple.siriinferenced 2>/dev/null | head -40 \
-            || launchctl print gui/$(id -u)/com.apple.siriinferenced 2>/dev/null | head -40 \
-            || echo "(not found)"
+          echo "=== Registered notify keys for intelligence ==="
+          timeout 5 notifyutil -1 "com.apple.intelligence.status" 2>/dev/null \
+            || echo "(not registered or timed out)"
         continue-on-error: true
 
       # ── PROBES ──────────────────────────────────────────────────────────
