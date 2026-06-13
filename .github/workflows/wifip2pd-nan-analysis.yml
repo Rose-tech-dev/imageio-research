@@ -1,0 +1,109 @@
+name: wifip2pd NAN PASN Analysis
+
+on:
+  workflow_dispatch:
+
+jobs:
+  analyze:
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: wifip2pd NAN and PASN frame handling analysis
+        run: |
+          WP="/usr/libexec/wifip2pd"
+          if [ ! -f "$WP" ]; then
+            echo "wifip2pd not found at $WP"
+            find /usr /System -name "wifip2pd" 2>/dev/null | head -5
+            exit 0
+          fi
+
+          echo "=== wifip2pd binary info ==="
+          file "$WP"
+          ls -la "$WP"
+
+          echo ""
+          echo "=== NAN frame processing strings ==="
+          strings "$WP" 2>/dev/null | grep -iE "(NAN|nan)" | grep -ivE "(banana|urban|organization|financial|manual|signal|channel|manu)" | sort -u | head -50
+
+          echo ""
+          echo "=== PASN authentication strings ==="
+          strings "$WP" 2>/dev/null | grep -iE "(PASN|pasn|pre.assoc|preassoc|WPA3|pmkid|PMKID)" | sort -u | head -30
+
+          echo ""
+          echo "=== Frame parsing strings ==="
+          strings "$WP" 2>/dev/null | grep -iE "(frame|Frame|FRAME|parse|Parse|decode|Decode|tlv|TLV|ie\b|IE\b)" | sort -u | head -40
+
+          echo ""
+          echo "=== Public key and crypto strings ==="
+          strings "$WP" 2>/dev/null | grep -iE "(pubkey|public.key|privateKey|ecdh|ECDH|P256|secp256|X25519|SAE|sae\b)" | sort -u | head -20
+
+          echo ""
+          echo "=== Memory/buffer size strings ==="
+          strings "$WP" 2>/dev/null | grep -iE "(length|Length|size|Size|overflow|bound|capacity)" | sort -u | head -30
+
+          echo ""
+          echo "=== Error strings related to validation ==="
+          strings "$WP" 2>/dev/null | grep -iE "(invalid|malformed|corrupt|truncat|unexpected|error|fail)" | sort -u | head -40
+
+      - name: wifip2pd ObjC and C++ classes
+        run: |
+          WP="/usr/libexec/wifip2pd"
+
+          echo "=== wifip2pd ObjC class names ==="
+          strings "$WP" 2>/dev/null | grep -E "^[A-Z][a-zA-Z]+" | grep -v "^NSS\|^UIK\|^CGP\|^NS" | sort -u | head -60
+
+          echo ""
+          echo "=== wifip2pd function names (C exports) ==="
+          nm -gU "$WP" 2>/dev/null | grep " T " | head -60 || otool -tV "$WP" 2>/dev/null | grep "^_" | head -40
+
+          echo ""
+          echo "=== wifip2pd entitlements ==="
+          codesign -d --entitlements - "$WP" 2>/dev/null
+
+          echo ""
+          echo "=== wifip2pd linked libraries ==="
+          otool -L "$WP" 2>/dev/null | head -30
+
+      - name: wifip2pd runtime analysis
+        run: |
+          echo "=== wifip2pd PID and sockets ==="
+          wifi_pid=$(pgrep wifip2pd | head -1)
+          if [ -n "$wifi_pid" ]; then
+            echo "PID: $wifi_pid"
+            lsof -p "$wifi_pid" -n -P 2>/dev/null | head -40
+            echo ""
+            echo "=== wifip2pd network connections ==="
+            lsof -p "$wifi_pid" -i -n -P 2>/dev/null | head -20
+          else
+            echo "wifip2pd not running"
+          fi
+
+          echo ""
+          echo "=== wifip2pd LaunchDaemon plist ==="
+          find /System/Library/LaunchDaemons /Library/LaunchDaemons -name "*wifip2pd*" 2>/dev/null | xargs plutil -convert json -o - 2>/dev/null | python3 -m json.tool 2>/dev/null | head -40 || echo "(not found)"
+
+          echo ""
+          echo "=== wifip2pd recent logs ==="
+          log show --predicate 'process == "wifip2pd"' --last 5m 2>/dev/null | grep -v "^$" | head -50 || true
+
+      - name: NAN SDF frame format reconstruction
+        run: |
+          WP="/usr/libexec/wifip2pd"
+          echo "=== NAN Service Discovery Frame format strings ==="
+          # NAN SDF contains: NAN service type, match filter, service info
+          strings "$WP" 2>/dev/null | grep -iE "(service.info|ServiceInfo|serviceInfo|match.filter|MatchFilter)" | sort -u | head -20
+
+          echo ""
+          echo "=== P2P and AWD protocol strings ==="
+          strings "$WP" 2>/dev/null | grep -iE "(p2p|P2P|awdl|AWDL|awdm|peer.to.peer)" | sort -u | head -30
+
+          echo ""
+          echo "=== Attribute ID constants (potential frame fields) ==="
+          # These are typically hex constants for protocol attribute IDs
+          strings "$WP" 2>/dev/null | grep -iE "attr|Attr|ATTR" | grep -v "attribute" | sort -u | head -20
+
+          echo ""
+          echo "=== wifip2pd XPC service names ==="
+          strings "$WP" 2>/dev/null | grep -iE "(com\.apple\.|xpc\.)" | sort -u | head -30
