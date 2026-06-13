@@ -1,0 +1,136 @@
+name: rapportd Protocol Extraction and NSXPCProxy Probe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ObjC protocol extraction from rapportd
+        run: python3 rapportd_objc_proto_extract.py 2>&1
+
+      - name: nm symbol table - protocols and XPC services
+        run: |
+          echo "=== nm: Protocol/PROTOCOL symbols ==="
+          nm -g /usr/libexec/rapportd 2>/dev/null | grep -iE "(Protocol|PROTOCOL|NSXPCInterface|RemoteDisplay|rapport)" | head -50
+
+          echo ""
+          echo "=== otool: ObjC class metadata (protocols only) ==="
+          otool -ov /usr/libexec/rapportd 2>/dev/null | \
+            awk '/Protocols:|protocol_t|instanceMethods|classMethods/{found=1} found{print; count++; if(count>300){exit}}' | head -200
+
+          echo ""
+          echo "=== otool: All ObjC class names ==="
+          otool -ov /usr/libexec/rapportd 2>/dev/null | grep -E "^  name " | head -60
+
+      - name: Search RemoteDisplay framework and companion daemons
+        run: |
+          echo "=== Private frameworks with 'Display' or 'Mirror' or 'Phone' ==="
+          ls /System/Library/PrivateFrameworks/ 2>/dev/null | \
+            grep -iE "(display|mirror|phone|rapport|continu|screen|iphone|capture)" | head -30
+
+          echo ""
+          echo "=== mirrord / mirroringd / phonelinkd locations ==="
+          for name in mirrord mirroringd phonelinkd continuousCapture screensharingd; do
+            f=$(which $name 2>/dev/null || find /usr/libexec /System/Library/CoreServices /System/Library/PrivateFrameworks -name "$name" 2>/dev/null | head -1)
+            if [ -n "$f" ]; then
+              echo "FOUND: $f"
+              strings "$f" 2>/dev/null | grep -E "(RemoteDisplay|rapport|Protocol|NSXPCInterface)" | head -10
+            else
+              echo "NOT FOUND: $name"
+            fi
+          done
+
+          echo ""
+          echo "=== Look for 'RemoteDisplay' in all PrivateFrameworks binaries ==="
+          find /System/Library/PrivateFrameworks -type f -name "*.framework" 2>/dev/null | head -5
+          grep -rl "com.apple.RemoteDisplay" /System/Library/PrivateFrameworks/ 2>/dev/null | head -20 || true
+          grep -rl "RemoteDisplayServer" /System/Library/ 2>/dev/null | head -10 || true
+
+      - name: Compile and run NSXPCProxy protocol probe
+        run: |
+          echo "=== Compiling NSXPCProxy protocol probe ==="
+          clang -o rapportd_nsxpc_proto_probe rapportd_nsxpc_proto_probe.m \
+            -framework Foundation 2>&1
+          echo "Compile exit: $?"
+
+          echo ""
+          echo "=== Running probe ==="
+          ./rapportd_nsxpc_proto_probe 2>&1 || true
+
+      - name: Check rapportd logs after NSXPCProxy probe
+        run: |
+          echo "=== rapportd logs (last 20s) ==="
+          log show --predicate 'process == "rapportd"' --last 20s 2>/dev/null | \
+            grep -vE "(WiFiManagerClient|Logging)" | head -60 || true
+
+      - name: Probe com.apple.rapport.people and .matching services
+        run: |
+          echo "=== Testing rapport.people and rapport.matching via NSXPCConnection ==="
+          cat > /tmp/probe_extra.swift << 'SWIFT_EOF'
+          import Foundation
+
+          let extras = [
+              "com.apple.rapport.people",
+              "com.apple.rapport.matching",
+              "com.apple.rapport.private-discovery",
+          ]
+
+          for name in extras {
+              print("Service: \(name)")
+              let conn = NSXPCConnection(machServiceName: name, options: NSXPCConnection.Options(rawValue: 0))
+              var status = "TIMEOUT (open)"
+              let sema = DispatchSemaphore(value: 0)
+              conn.invalidationHandler = { status = "INVALIDATED"; sema.signal() }
+              conn.interruptionHandler = { status = "INTERRUPTED"; sema.signal() }
+              conn.resume()
+              if sema.wait(timeout: .now() + .seconds(3)) == .timedOut {
+                  status = "TIMEOUT (stayed open 3s) = ACCESSIBLE"
+              }
+              conn.invalidate()
+              print("  -> \(status)")
+          }
+          SWIFT_EOF
+          swiftc /tmp/probe_extra.swift -o /tmp/probe_extra 2>&1
+          /tmp/probe_extra 2>&1 || true
+
+      - name: Deep binary analysis - rapportd listener setup and protocol assignment
+        run: |
+          RAPPORT="/usr/libexec/rapportd"
+
+          echo "=== All com.apple.* service strings ==="
+          strings "$RAPPORT" 2>/dev/null | grep "^com\.apple\." | sort -u | head -60
+
+          echo ""
+          echo "=== XPC listener / server strings ==="
+          strings "$RAPPORT" 2>/dev/null | \
+            grep -iE "(NSXPCListener|machServiceName|listenerWithMachServiceName|serviceWithName|registerService)" | head -20
+
+          echo ""
+          echo "=== NSXPCInterface + setExported + remoteObject strings ==="
+          strings "$RAPPORT" 2>/dev/null | \
+            grep -iE "(setExported|exportedInterface|remoteObjectInterface|interfaceWithProtocol|allowedClasses)" | head -20
+
+          echo ""
+          echo "=== Connection handler strings (what rapportd does on new connection) ==="
+          strings "$RAPPORT" 2>/dev/null | \
+            grep -iE "(newConnection|connection.*accepted|listener.*connection|connection.*handler)" | head -20
+
+          echo ""
+          echo "=== Error message strings near entitlement checks ==="
+          strings "$RAPPORT" 2>/dev/null | \
+            grep -iE "(entitlement|authorization|permission|privileged|unauthorized|denied|forbidden)" | head -20
+
+          echo ""
+          echo "=== audit token / task port / pid / uid strings (process verification) ==="
+          strings "$RAPPORT" 2>/dev/null | \
+            grep -iE "(auditToken|taskPort|SecCode|SecTask|getpid|getuid|peer.*pid|connection.*pid)" | head -20
+
+          echo ""
+          echo "=== Mach send rights / port names for com.apple.RemoteDisplay ==="
+          strings "$RAPPORT" 2>/dev/null | \
+            grep -E "(RemoteDisplay|remoteDisplay)" | sort -u | head -30
