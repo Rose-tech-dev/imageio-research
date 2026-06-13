@@ -112,3 +112,32 @@ jobs:
           if [ -n "$rapport_pid" ]; then
             lsof -p "$rapport_pid" 2>/dev/null | grep -v "mem\|txt\|cwd\|rtd" | head -40
           fi
+
+      - name: Preference bypass probe - _prefIgnoreRemoteDisplayChecks
+        run: |
+          echo "=== RAPPORTD FULL ENTITLEMENTS ==="
+          codesign -d --entitlements - /usr/libexec/rapportd 2>/dev/null
+
+          echo ""
+          echo "=== RAPPORTD ALL _pref STRINGS ==="
+          strings /usr/libexec/rapportd 2>/dev/null | grep -E "^_pref" | sort -u
+
+          echo ""
+          echo "=== TEST: Write _prefIgnoreRemoteDisplayChecks to user prefs ==="
+          defaults write com.apple.rapportd _prefIgnoreRemoteDisplayChecks -bool YES
+          echo "Write result: $?"
+          echo "Read back: $(defaults read com.apple.rapportd _prefIgnoreRemoteDisplayChecks 2>/dev/null || echo FAILED)"
+
+          echo ""
+          echo "=== LaunchDaemon plist for rapportd ==="
+          plutil -convert json -o - /System/Library/LaunchDaemons/com.apple.rapportd.plist 2>/dev/null | python3 -m json.tool 2>/dev/null | head -40 || echo "(not found)"
+
+          echo ""
+          echo "=== Advertise with bypass pref + TCP listener ==="
+          python3 pref_bypass_probe.py 2>&1
+
+          echo ""
+          echo "=== Cleanup prefs ==="
+          defaults delete com.apple.rapportd _prefIgnoreRemoteDisplayChecks 2>/dev/null || true
+          defaults delete com.apple.rapportd _prefServerBonjourOpportunitistic 2>/dev/null || true
+          echo "Done."
