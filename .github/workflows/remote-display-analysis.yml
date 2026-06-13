@@ -1,0 +1,122 @@
+name: RemoteDisplay Daemon Analysis
+
+on:
+  workflow_dispatch:
+
+jobs:
+  analyze:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - name: Find RemoteDisplay and Replicator daemons
+        run: |
+          echo "=== LAUNCH DAEMONS WITH RemoteDisplay/replicator ==="
+          grep -rl "RemoteDisplay\|replicator\|Replicator\|wifip2pd\|ScreenContinuity" \
+            /System/Library/LaunchDaemons \
+            /System/Library/LaunchAgents 2>/dev/null
+
+          echo ""
+          echo "=== BINARY SEARCH FOR RemoteDisplay ==="
+          find /usr/libexec /System/Library /System/Applications -name "*RemoteDisplay*" \
+            -o -name "*replicat*" \
+            -o -name "*ScreenContinuity*" \
+            2>/dev/null | grep -v ".strings\|.nib\|.car\|.icns\|.png" | head -20
+
+      - name: Dump all matching LaunchDaemon plists
+        run: |
+          echo "=== PLISTS ==="
+          for f in $(grep -rl "RemoteDisplay\|replicator\|replicatorservices\|wifip2pd" \
+            /System/Library/LaunchDaemons \
+            /System/Library/LaunchAgents 2>/dev/null | head -15); do
+            echo "=== $f ==="
+            plutil -p "$f" 2>/dev/null
+            echo ""
+          done
+
+      - name: Entitlements for RemoteDisplay service binary
+        run: |
+          echo "=== FINDING RemoteDisplay SERVICE BINARY ==="
+          # Look in common daemon locations
+          for path in \
+            "/usr/libexec/remotemanagementd" \
+            "/usr/libexec/remotepairingd" \
+            "/System/Library/PrivateFrameworks/RemoteDisplay.framework/Support/RemoteDisplay" \
+            "/System/Library/PrivateFrameworks/CoreRemoteUI.framework/Support/RemoteDisplay" \
+            "/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/MacOS/ARDAgent"; do
+            if [ -f "$path" ]; then
+              echo "FOUND: $path"
+              codesign -d --entitlements :- "$path" 2>/dev/null
+              echo ""
+            fi
+          done
+
+          # General search
+          BINARIES=$(find /System/Library/PrivateFrameworks -name "*RemoteDisplay*" 2>/dev/null | grep -v ".strings\|Contents/Resources")
+          for b in $BINARIES; do
+            echo "=== $b ==="
+            codesign -d --entitlements :- "$b" 2>/dev/null || true
+          done
+
+      - name: Check what process provides com.apple.RemoteDisplay mach service
+        run: |
+          echo "=== LAUNCHCTL - RemoteDisplay service ==="
+          launchctl print system/ 2>/dev/null | grep -A 5 -i "remotedisplay\|replicat"
+          echo ""
+          launchctl print gui/$(id -u)/ 2>/dev/null | grep -A 5 -i "remotedisplay\|replicat"
+
+          echo ""
+          echo "=== ALL MACH SERVICES WITH remote/replicat ==="
+          launchctl print system/ 2>/dev/null | grep -i "remote\|replicat"
+
+      - name: Analyze wifip2pd - the Wi-Fi P2P transport
+        run: |
+          WD=$(find /usr/libexec /System/Library -name "wifip2pd" 2>/dev/null | head -1)
+          echo "wifip2pd: $WD"
+          if [ -n "$WD" ]; then
+            echo "=== ENTITLEMENTS ==="
+            codesign -d --entitlements :- "$WD" 2>/dev/null
+            echo ""
+            echo "=== KEY STRINGS ==="
+            strings "$WD" 2>/dev/null | grep -iE "(mirror|replicat|pair|auth|session|XPC|mach|service|trust|token|key|cert)" | sort -u | head -80
+          fi
+
+      - name: Analyze com.apple.replicatorservices
+        run: |
+          echo "=== REPLICATOR SERVICES ==="
+          RS=$(find /System/Library /usr/libexec -name "*replicat*" 2>/dev/null | grep -v ".strings\|.car\|.icns" | head -10)
+          echo "$RS"
+          for b in $RS; do
+            if [ -f "$b" ]; then
+              echo "=== $b ENTITLEMENTS ==="
+              codesign -d --entitlements :- "$b" 2>/dev/null || true
+              echo ""
+              echo "=== $b STRINGS ==="
+              strings "$b" 2>/dev/null | grep -iE "(XPC|mach|service|pair|auth|trust|session|mirror|phone|iOS)" | sort -u | head -50 || true
+            fi
+          done
+
+      - name: Look at ScreenContinuityUI framework internals
+        run: |
+          SCUI="/System/Applications/iPhone Mirroring.app/Contents/Frameworks/ScreenContinuityUI.framework/Versions/A/ScreenContinuityUI"
+          if [ -f "$SCUI" ]; then
+            echo "=== ScreenContinuityUI ENTITLEMENTS ==="
+            codesign -d --entitlements :- "$SCUI" 2>/dev/null
+            echo ""
+            echo "=== ScreenContinuityUI STRINGS (XPC/auth/pair/session) ==="
+            strings "$SCUI" 2>/dev/null | grep -iE "(xpc|mach|pair|auth|trust|session|mirror|phone|iOS|remote|display|surface|IOSurface)" | sort -u | head -100
+          fi
+
+      - name: Find RemoteDisplay framework and dump its strings
+        run: |
+          RDF=$(find /System/Library/PrivateFrameworks -path "*RemoteDisplay*" -name "RemoteDisplay" 2>/dev/null | head -1)
+          echo "RemoteDisplay framework: $RDF"
+          if [ -n "$RDF" ]; then
+            echo "=== ENTITLEMENTS ==="
+            codesign -d --entitlements :- "$RDF" 2>/dev/null || true
+            echo ""
+            echo "=== KEY STRINGS ==="
+            strings "$RDF" 2>/dev/null | grep -iE "(xpc|mach|pair|auth|trust|session|surface|IOSurface|render|frame|buffer|input|touch|inject)" | sort -u | head -100
+          else
+            echo "Searching more broadly..."
+            find /System -name "RemoteDisplay" -type f 2>/dev/null
+          fi
