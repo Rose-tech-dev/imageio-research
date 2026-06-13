@@ -1,0 +1,114 @@
+name: RPNWFramer TCP Framing Fuzzer
+
+on:
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: rapportd network socket enumeration
+        run: |
+          echo "=== rapportd PID ==="
+          pgrep -la rapportd
+
+          echo ""
+          echo "=== ALL rapportd network sockets (lsof) ==="
+          rapport_pid=$(pgrep rapportd | head -1)
+          lsof -p "$rapport_pid" -i -n -P 2>/dev/null || echo "(lsof failed)"
+
+          echo ""
+          echo "=== ALL LISTENING TCP ports on system ==="
+          netstat -an -p tcp 2>/dev/null | grep LISTEN | head -60 || true
+
+          echo ""
+          echo "=== rapportd Unix domain sockets ==="
+          lsof -p "$rapport_pid" -U -n 2>/dev/null | head -30 || echo "(none)"
+
+          echo ""
+          echo "=== Mach ports rapportd registered ==="
+          # launchctl doesn't directly show mach services but we can try
+          launchctl dumpstate 2>/dev/null | grep -A3 "com.apple.rapport" | head -30 || true
+
+      - name: Deep rapportd port and socket analysis
+        run: |
+          rapport_pid=$(pgrep rapportd | head -1)
+          echo "=== rapportd ALL open file descriptors ==="
+          lsof -p "$rapport_pid" -n -P 2>/dev/null | head -80
+
+          echo ""
+          echo "=== ss / netstat rapportd binding ==="
+          # Check if rapportd bound any port on all interfaces
+          netstat -an 2>/dev/null | grep -E "LISTEN|ESTABLISHED" | head -100 || true
+
+          echo ""
+          echo "=== rapportd strings: port/socket/listen keywords ==="
+          strings /usr/libexec/rapportd 2>/dev/null | grep -iE "(listen|bind|accept|port|socket|SO_REUSEPORT|SO_REUSEADDR|tcp.server|TCPServer|RPNWServer|RPNWListener)" | sort -u | head -40
+
+          echo ""
+          echo "=== rapportd strings: frame format clues ==="
+          strings /usr/libexec/rapportd 2>/dev/null | grep -iE "(magic|header|frame|framing|RPNWFrame|framer|body|payload)" | sort -u | head -30
+
+          echo ""
+          echo "=== rapportd strings: Bonjour server port TXT record ==="
+          # rapportd registers its own service - what port?
+          strings /usr/libexec/rapportd 2>/dev/null | grep -iE "(port|Port|PORT)" | grep -v "import\|export\|report\|transport\|support" | sort -u | head -20
+
+      - name: Analyze RPNWFramer ObjC class structure
+        run: |
+          echo "=== RPNWFramer / RPNWPeer class methods ==="
+          # Use otool to get ObjC method list
+          otool -ov /usr/libexec/rapportd 2>/dev/null | grep -A2 "RPNWFramer\|RPNWPeer\|RPNWNetwork\|RPNWServer\|RPNWConnection" | head -80 || true
+
+          echo ""
+          echo "=== rapportd class names related to server/connection ==="
+          strings /usr/libexec/rapportd 2>/dev/null | grep -E "^RP" | grep -iE "(Server|Listener|Accept|Connection|Session|TCP|Socket)" | sort -u | head -40
+
+          echo ""
+          echo "=== rapportd entitlements (security context) ==="
+          codesign -d --entitlements - /usr/libexec/rapportd 2>/dev/null | head -60 || true
+
+          echo ""
+          echo "=== wifip2pd network sockets ==="
+          wifip_pid=$(pgrep wifip2pd | head -1)
+          if [ -n "$wifip_pid" ]; then
+            lsof -p "$wifip_pid" -i -n -P 2>/dev/null | head -20
+          fi
+
+      - name: Run RPNWFramer TCP fuzzer
+        run: |
+          python3 rpnw_framer_fuzz.py 2>&1
+
+      - name: Check for crashes and memory after TCP fuzzing
+        run: |
+          echo "=== rapportd STATUS ==="
+          pgrep -la rapportd || echo "rapportd NOT FOUND"
+
+          echo ""
+          echo "=== CRASH REPORTS ==="
+          ls ~/Library/Logs/DiagnosticReports/ 2>/dev/null | grep -i rapport || echo "none"
+          ls /Library/Logs/DiagnosticReports/ 2>/dev/null | grep -i rapport || echo "none"
+
+          echo ""
+          echo "=== rapportd logs during TCP fuzzing ==="
+          log show --predicate 'process == "rapportd"' --last 5m 2>/dev/null \
+            | grep -vE "WiFiManagerClient" \
+            | grep -iE "(connect|frame|tcp|error|parse|invalid|crash|exception|framer|client|peer|session|accept)" \
+            | head -80 || true
+
+      - name: Also analyze rapportd binary for RPNWFramer frame parsing code
+        run: |
+          echo "=== RPNWFramer frame type constants ==="
+          strings /usr/libexec/rapportd 2>/dev/null | grep -iE "(0x[0-9a-fA-F]{4,8}|frame.type|FrameType|message.type|MessageType)" | sort -u | head -30
+
+          echo ""
+          echo "=== rapportd binary sections ==="
+          otool -l /usr/libexec/rapportd 2>/dev/null | grep -E "(sectname|segname|size)" | head -60
+
+          echo ""
+          echo "=== Checking rapportd for hardcoded port numbers ==="
+          # Extract all 4-5 digit numbers that could be ports
+          strings /usr/libexec/rapportd 2>/dev/null | grep -E "^[0-9]{4,5}$" | sort -u | head -30
