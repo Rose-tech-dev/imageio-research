@@ -1,0 +1,131 @@
+name: replicatord Deep Analysis
+
+on:
+  workflow_dispatch:
+
+jobs:
+  analyze:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - name: replicatord LaunchAgent plist and sandbox
+        run: |
+          echo "=== com.apple.replicatord.plist ==="
+          plutil -p /System/Library/LaunchAgents/com.apple.replicatord.plist 2>/dev/null
+
+          echo ""
+          echo "=== replicatord SANDBOX PROFILE ==="
+          cat /System/Library/Sandbox/Profiles/com.apple.replicatord.sb 2>/dev/null | head -100
+
+          echo ""
+          echo "=== clientDescriptors ==="
+          find /System/Library/replicatord -type f 2>/dev/null
+          for f in $(find /System/Library/replicatord -name "*.plist" 2>/dev/null); do
+            echo "=== $f ==="
+            plutil -p "$f" 2>/dev/null
+          done
+
+      - name: replicatord binary entitlements and info
+        run: |
+          RD="/System/Library/PrivateFrameworks/ReplicatorCore.framework/Support/replicatord"
+          echo "=== STAT ==="
+          ls -la "$RD" 2>/dev/null
+          echo ""
+          echo "=== ENTITLEMENTS ==="
+          codesign -d --entitlements :- "$RD" 2>/dev/null || true
+          echo ""
+          echo "=== CODE SIGNATURE INFO ==="
+          codesign -dvvv "$RD" 2>&1 | head -30
+
+      - name: replicatord strings - auth session pairing XPC
+        run: |
+          RD="/System/Library/PrivateFrameworks/ReplicatorCore.framework/Support/replicatord"
+          echo "=== STRINGS: XPC services ==="
+          strings "$RD" 2>/dev/null | grep -iE "^com\.apple\." | sort -u | head -60
+
+          echo ""
+          echo "=== STRINGS: auth/pair/trust/cert/token/key ==="
+          strings "$RD" 2>/dev/null | grep -iE "(auth|pair|trust|cert|token|key|secur|cred|verif|sign|identity)" | sort -u | head -80
+
+          echo ""
+          echo "=== STRINGS: session/connect/state/error ==="
+          strings "$RD" 2>/dev/null | grep -iE "(session|connect|state|error|fail|reject|accept|handshak)" | sort -u | head -60
+
+          echo ""
+          echo "=== STRINGS: IOSurface/frame/screen/display/touch/input ==="
+          strings "$RD" 2>/dev/null | grep -iE "(IOSurface|surface|frame|screen|display|touch|input|inject|render|pixel|buffer|metal)" | sort -u | head -60
+
+          echo ""
+          echo "=== ALL UNIQUE STRINGS (sorted, > 10 chars) ==="
+          strings "$RD" 2>/dev/null | awk 'length > 10' | sort -u | head -200
+
+      - name: rapportd - the Continuity daemon
+        run: |
+          echo "=== rapportd PLIST ==="
+          plutil -p /System/Library/LaunchAgents/com.apple.rapportd-user.plist 2>/dev/null || true
+          plutil -p /System/Library/LaunchDaemons/com.apple.rapportd.plist 2>/dev/null || true
+
+          RAPPORT=$(find /usr/libexec /System/Library -name "rapportd" 2>/dev/null | head -1)
+          echo ""
+          echo "=== rapportd binary: $RAPPORT ==="
+          ls -la "$RAPPORT" 2>/dev/null || true
+          echo ""
+          echo "=== rapportd ENTITLEMENTS ==="
+          codesign -d --entitlements :- "$RAPPORT" 2>/dev/null || true
+          echo ""
+          echo "=== rapportd STRINGS: XPC services ==="
+          strings "$RAPPORT" 2>/dev/null | grep -E "^com\.apple\." | sort -u | head -60
+
+          echo ""
+          echo "=== rapportd STRINGS: replicat/mirror/phone ==="
+          strings "$RAPPORT" 2>/dev/null | grep -iE "(replicat|mirror|phone|iPhone|screencast|remote)" | sort -u | head -60
+
+      - name: ScreenContinuityServices framework
+        run: |
+          SCS="/System/Library/PrivateFrameworks/ScreenContinuityServices.framework/ScreenContinuityServices"
+          echo "=== ENTITLEMENTS ==="
+          codesign -d --entitlements :- "$SCS" 2>/dev/null || true
+          echo ""
+          echo "=== STRINGS: XPC/Mach services ==="
+          strings "$SCS" 2>/dev/null | grep -E "^com\.apple\." | sort -u | head -80
+
+          echo ""
+          echo "=== STRINGS: auth/pair/session/input/touch ==="
+          strings "$SCS" 2>/dev/null | grep -iE "(auth|pair|session|trust|input|touch|inject|remote|display|surface|IOSurface)" | sort -u | head -80
+
+          echo ""
+          echo "=== EXPORTS (nm) ==="
+          nm -g "$SCS" 2>/dev/null | grep " T " | head -100 || true
+
+      - name: ReplicatorCore framework - not just the daemon
+        run: |
+          RC="/System/Library/PrivateFrameworks/ReplicatorCore.framework/ReplicatorCore"
+          echo "=== ReplicatorCore framework ENTITLEMENTS ==="
+          codesign -d --entitlements :- "$RC" 2>/dev/null || true
+          echo ""
+          echo "=== STRINGS: XPC/Mach service names ==="
+          strings "$RC" 2>/dev/null | grep -E "^com\.apple\." | sort -u | head -80
+          echo ""
+          echo "=== STRINGS: auth/pair/session/error message keywords ==="
+          strings "$RC" 2>/dev/null | grep -iE "(auth|pair|session|trust|reject|error|fail|verif|sign)" | sort -u | head -100
+          echo ""
+          echo "=== STRINGS: IOSurface/frame/input ==="
+          strings "$RC" 2>/dev/null | grep -iE "(IOSurface|surface|frame|input|touch|inject|display|screen)" | sort -u | head -60
+
+      - name: Find who registers com.apple.RemoteDisplay Mach service
+        run: |
+          echo "=== WHAT PLIST REGISTERS com.apple.RemoteDisplay ==="
+          grep -rl "com.apple.RemoteDisplay" \
+            /System/Library/LaunchDaemons \
+            /System/Library/LaunchAgents \
+            /System/Applications \
+            /Library \
+            2>/dev/null | head -20
+
+          echo ""
+          echo "=== SEARCH ALL PLISTS SYSTEM-WIDE ==="
+          find /System/Library -name "*.plist" 2>/dev/null | xargs grep -l "RemoteDisplay" 2>/dev/null | head -20
+
+          echo ""
+          echo "=== WHAT FRAMEWORKS EXPORT com.apple.RemoteDisplay ==="
+          find /System/Library/PrivateFrameworks /System/Library/Frameworks -name "*.plist" 2>/dev/null | xargs grep -l "RemoteDisplay" 2>/dev/null | head -20
