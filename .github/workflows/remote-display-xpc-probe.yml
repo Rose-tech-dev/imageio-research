@@ -1,4 +1,4 @@
-name: rapportd Remote Display XPC Probe
+name: rapportd Remote Display XPC and Binary Analysis
 
 on:
   workflow_dispatch:
@@ -10,243 +10,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Find rapportd pref reader code path
-        run: |
-          RAPPORT="/usr/libexec/rapportd"
+      - name: rapportd binary analysis - pref cross-references
+        run: python3 rapportd_binary_analysis.py 2>&1
 
-          echo "=== rapportd _prefIgnoreRemoteDisplayChecks cross-reference ==="
-          # Find the offset of the string in the binary
-          python3 - <<'PYEOF'
-import struct, mmap, os, sys
+      - name: rapportd XPC service probe (ctypes)
+        run: python3 rapportd_xpc_probe.py 2>&1
 
-path = "/usr/libexec/rapportd"
-target = b"_prefIgnoreRemoteDisplayChecks"
-target2 = b"_prefIgnoreCompanionLinkChecks"
-target3 = b"_prefServerBonjourOpportunitistic"
-target4 = b"_prefServerBonjourAlways"
+      - name: Swift XPC connection probe
+        run: python3 rapportd_xpc_swift_probe.py 2>&1
 
-with open(path, "rb") as f:
-    data = f.read()
-
-for tgt in [target, target2, target3, target4]:
-    offset = 0
-    while True:
-        idx = data.find(tgt, offset)
-        if idx == -1:
-            break
-        print(f"String '{tgt.decode()}' at file offset 0x{idx:x} ({idx})")
-        offset = idx + 1
-
-# Also find NSUserDefaults/CFPreferences usage
-for api in [b"NSUserDefaults", b"CFPreferencesCopyAppValue", b"CFPreferencesGetAppBooleanValue",
-            b"boolForKey:", b"objectForKey:", b"CFPreferencesAppSynchronize"]:
-    idx = data.find(api)
-    if idx != -1:
-        print(f"API reference '{api.decode()}' at file offset 0x{idx:x}")
-PYEOF
-
-          echo ""
-          echo "=== rapportd preference reading strings ==="
-          strings -a "$RAPPORT" | grep -iE "(NSUserDefaults|CFPreferences|boolForKey|objectForKey|preferredUser)" | sort -u | head -30
-
-          echo ""
-          echo "=== rapportd __DATA section for pref domain constants ==="
-          # Look for kCFPreferences constants embedded as strings
-          strings -a "$RAPPORT" | grep -iE "(kCFPreferences|AnyUser|CurrentUser|CurrentHost|AnyHost|_NSDefaults)" | sort -u | head -20
-
-      - name: Analyze _prefIgnoreRemoteDisplayChecks in binary
-        run: |
-          python3 - <<'PYEOF'
-import subprocess, struct, sys
-
-path = "/usr/libexec/rapportd"
-with open(path, "rb") as f:
-    data = f.read()
-
-target = b"_prefIgnoreRemoteDisplayChecks\x00"
-idx = data.find(target)
-if idx == -1:
-    print("String not found")
-    sys.exit(0)
-
-print(f"Found at offset 0x{idx:x}")
-
-# Dump surrounding bytes (might reveal struct/class context)
-start = max(0, idx - 64)
-end = min(len(data), idx + len(target) + 128)
-chunk = data[start:end]
-print(f"Context bytes around string (offset 0x{start:x}):")
-for i in range(0, len(chunk), 16):
-    hex_part = ' '.join(f'{b:02x}' for b in chunk[i:i+16])
-    asc_part = ''.join(chr(b) if 32 <= b < 127 else '.' for b in chunk[i:i+16])
-    print(f"  {start+i:08x}  {hex_part:<48}  {asc_part}")
-
-# Look for other nearby strings that give context
-nearby_strings = []
-for off in range(max(0, idx - 512), min(len(data), idx + 512)):
-    if data[off:off+1] == b'\x00':
-        continue
-    # Find null-terminated string starting at off
-    end_nul = data.find(b'\x00', off)
-    if 4 <= end_nul - off <= 120:
-        s = data[off:end_nul]
-        if all(32 <= b < 127 for b in s):
-            if s not in nearby_strings:
-                nearby_strings.append(s)
-
-print(f"\nNearby strings (within 512 bytes):")
-for s in nearby_strings[:30]:
-    print(f"  {s.decode()}")
-PYEOF
-
-      - name: Probe com.apple.RemoteDisplay XPC service
-        run: |
-          echo "=== Check if com.apple.RemoteDisplay is registered ==="
-          # launchctl print shows registered mach services
-          launchctl print system/com.apple.rapportd 2>/dev/null | head -30 || true
-          launchctl print gui/$(id -u)/com.apple.rapportd 2>/dev/null | head -30 || true
-
-          echo ""
-          echo "=== Check service via bootstrap ==="
-          # Try to look up the mach service
-          python3 - <<'PYEOF'
-import subprocess, os
-
-services_to_check = [
-    "com.apple.RemoteDisplay",
-    "com.apple.rapport.matching",
-    "com.apple.AutoUnlock.System.AuthenticationHintsProvider",
-    "com.apple.wifivelocityd.rapportWake",
-]
-
-for svc in services_to_check:
-    # Try to resolve via launchctl
-    r = subprocess.run(
-        ["launchctl", "print-disabled", "system"],
-        capture_output=True, text=True
-    )
-    found = svc in r.stdout
-    print(f"{'[FOUND]' if found else '[ -- ]'} {svc} in system context")
-
-    r2 = subprocess.run(
-        ["launchctl", "print-disabled", f"gui/{os.getuid()}"],
-        capture_output=True, text=True
-    )
-    found2 = svc in r2.stdout
-    print(f"{'[FOUND]' if found2 else '[ -- ]'} {svc} in user context")
-PYEOF
-
-      - name: Attempt XPC connection to com.apple.RemoteDisplay
-        run: |
-          python3 - <<'PYEOF'
-import subprocess, os, sys
-
-# Try connecting to the service using swift/obj-c inline binary
-# First verify rapportd is running
-r = subprocess.run(["pgrep", "rapportd"], capture_output=True, text=True)
-if not r.stdout.strip():
-    print("rapportd not running!")
-    sys.exit(1)
-
-pid = int(r.stdout.strip().split()[0])
-print(f"rapportd PID: {pid}")
-
-# Check if the mach service is actually registered in launchd
-r2 = subprocess.run(
-    ["launchctl", "dumpstate"],
-    capture_output=True, text=True, timeout=15
-)
-text = r2.stdout
-
-# Find rapportd's registered services
-import re
-# Find rapportd section
-lines = text.split('\n')
-in_rapport = False
-rapport_lines = []
-for i, line in enumerate(lines):
-    if 'rapportd' in line and 'pid' in line.lower():
-        in_rapport = True
-    if in_rapport:
-        rapport_lines.append(line)
-        if line.strip() == '}' and len(rapport_lines) > 3:
-            break
-
-if rapport_lines:
-    print("\nrapportd dumpstate entry:")
-    for l in rapport_lines[:60]:
-        print(f"  {l}")
-else:
-    # Search for RemoteDisplay in full dumpstate
-    print("\nSearching for RemoteDisplay service:")
-    for i, line in enumerate(lines):
-        if 'RemoteDisplay' in line or 'rapport' in line.lower():
-            print(f"  [{i}] {line}")
-    print(f"\n(Total dumpstate lines: {len(lines)})")
-PYEOF
-
-      - name: Swift XPC probe - connect to com.apple.RemoteDisplay
-        run: |
-          # Write a Swift program to connect to the XPC service and probe messages
-          cat > /tmp/xpc_probe.swift << 'EOF'
-import Foundation
-import XPC
-
-let serviceName = "com.apple.RemoteDisplay"
-print("Attempting connection to \(serviceName)...")
-
-let conn = xpc_connection_create_mach_service(serviceName, nil, 0)
-if conn == nil {
-    print("FAILED: Could not create connection to \(serviceName)")
-    exit(1)
-}
-
-xpc_connection_set_event_handler(conn!) { event in
-    let type = xpc_get_type(event)
-    if xpc_equal(type, XPC_TYPE_ERROR) {
-        let desc = xpc_copy_description(event)
-        print("XPC Error: \(String(cString: desc!))")
-    } else {
-        let desc = xpc_copy_description(event)
-        print("XPC Event: \(String(cString: desc!))")
-    }
-}
-
-xpc_connection_resume(conn!)
-print("Connection resumed. Sending probe message...")
-
-// Send a simple ping/probe dictionary
-let msg = xpc_dictionary_create(nil, nil, 0)
-xpc_dictionary_set_string(msg!, "type", "probe")
-xpc_dictionary_set_uint64(msg!, "version", 1)
-
-let reply = xpc_connection_send_message_with_reply_sync(conn!, msg!)
-if let reply = reply {
-    let rtype = xpc_get_type(reply)
-    if xpc_equal(rtype, XPC_TYPE_ERROR) {
-        let desc = xpc_copy_description(reply)
-        print("Reply Error: \(String(cString: desc!))")
-    } else {
-        let desc = xpc_copy_description(reply)
-        print("Reply: \(String(cString: desc!))")
-    }
-} else {
-    print("No reply received")
-}
-
-print("Done.")
-EOF
-
-          echo "Compiling Swift XPC probe..."
-          swiftc /tmp/xpc_probe.swift -o /tmp/xpc_probe 2>&1 || echo "(compilation failed)"
-
-          if [ -f /tmp/xpc_probe ]; then
-            echo ""
-            echo "Running probe..."
-            timeout 10 /tmp/xpc_probe 2>&1 || true
-          fi
-
-      - name: Analyze RPRemoteDisplayDaemon class methods
+      - name: RPRemoteDisplayDaemon class and XPC strings
         run: |
           RAPPORT="/usr/libexec/rapportd"
 
@@ -254,91 +27,16 @@ EOF
           strings "$RAPPORT" 2>/dev/null | grep -E "RPRemoteDisplay" | sort -u | head -40
 
           echo ""
-          echo "=== RemoteDisplay XPC handler strings ==="
-          strings "$RAPPORT" 2>/dev/null | grep -iE "(RemoteDisplay|remoteDisplay|remote.display)" | sort -u | head -30
+          echo "=== RemoteDisplay and session strings ==="
+          strings "$RAPPORT" 2>/dev/null | grep -iE "(RemoteDisplay|remoteDisplay|Wombat|wombat|SFPhone|SFSession|SFStream)" | sort -u | head -40
 
           echo ""
-          echo "=== iPhone Mirroring session strings ==="
-          strings "$RAPPORT" 2>/dev/null | grep -iE "(mirror|Mirror|session|Session|wombat|Wombat|SFWombat)" | sort -u | head -30
+          echo "=== com.apple service names in rapportd ==="
+          strings "$RAPPORT" 2>/dev/null | grep "com.apple" | sort -u | head -50
 
           echo ""
-          echo "=== com.apple.RemoteDisplay strings ==="
-          strings "$RAPPORT" 2>/dev/null | grep "com.apple.RemoteDisplay" | sort -u
+          echo "=== ObjC selectors - auth and connection ==="
+          strings "$RAPPORT" 2>/dev/null | grep -iE "(authenticate|checkEntitlement|checkPermission|startMirroring|stopMirroring|findListener|createConnection)" | sort -u | head -25
 
-          echo ""
-          echo "=== XPC handler method signatures ==="
-          strings "$RAPPORT" 2>/dev/null | grep -iE "(xpcInterface|XPCInterface|xpc.interface|_xpc|XPCListener|XPCConnection|XPCMessage)" | sort -u | head -20
-
-          echo ""
-          echo "=== rapportd SFWombat/SFPhone state strings ==="
-          strings "$RAPPORT" 2>/dev/null | grep -iE "(SFPhone|SFSession|SFStream|SFWombat|OutOfDiscovery|InDiscovery|InSession|Connected|Disconnected)" | sort -u | head -30
-
-          echo ""
-          echo "=== rapportd network connection strings ==="
-          strings "$RAPPORT" 2>/dev/null | grep -iE "(startMirroring|stopMirroring|connectTo|connectionFor|createConnection|peerConnect)" | sort -u | head -20
-
-      - name: Probe _prefIPEnabled and infrastructure browsing
-        run: |
-          echo "=== Set _prefIPEnabled to test IP-based browsing ==="
-          defaults write com.apple.rapportd _prefIPEnabled -bool YES
-          defaults write com.apple.rapportd _prefNoInfra -bool NO
-          defaults write com.apple.rapportd _prefIgnoreRemoteDisplayChecks -bool YES
-          echo "Current prefs:"
-          defaults read com.apple.rapportd 2>/dev/null
-
-          echo ""
-          echo "Restarting rapportd with IP prefs..."
-          killall -HUP rapportd 2>/dev/null || true
-          sleep 4
-
-          new_pid=$(pgrep rapportd | head -1)
-          echo "New rapportd PID: $new_pid"
-
-          echo ""
-          echo "=== Enable debug logging ==="
-          sudo log config --subsystem com.apple.rapport --mode level:debug 2>/dev/null || true
-
-          echo ""
-          echo "=== Advertise _rdlink._tcp over infrastructure + monitor logs ==="
-          dns-sd -R "TestiPhone" _rdlink._tcp local 9998 \
-            rpFl=98304 rpHI=TestHI rpHN=TestHN rpHA=bypass_test \
-            rpMd=iPhone16,2 rpVr=1.0 &
-          DNSSD_PID=$!
-
-          # Also try on a specific IP
-          echo "Listening on 9998..."
-          python3 -c "
-import socket, time
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(('0.0.0.0', 9998))
-s.listen(5)
-s.settimeout(15)
-try:
-    conn, addr = s.accept()
-    print('CONNECTION from %s:%d' % addr, flush=True)
-    data = conn.recv(4096)
-    print('Data: %s' % data.hex(), flush=True)
-    conn.close()
-except socket.timeout:
-    print('No connection in 15s', flush=True)
-finally:
-    s.close()
-" &
-          SOCK_PID=$!
-
-          sleep 18
-          kill $DNSSD_PID 2>/dev/null || true
-          kill $SOCK_PID 2>/dev/null || true
-          wait
-
-          echo ""
-          echo "=== rapportd logs during IP browsing test ==="
-          log show --predicate 'process == "rapportd"' --last 25s 2>/dev/null | \
-            grep -vE "(WiFiManagerClient|Logging)" | head -60 || true
-
-          echo ""
-          echo "Cleanup..."
-          defaults delete com.apple.rapportd _prefIPEnabled 2>/dev/null || true
-          defaults delete com.apple.rapportd _prefNoInfra 2>/dev/null || true
-          defaults delete com.apple.rapportd _prefIgnoreRemoteDisplayChecks 2>/dev/null || true
+      - name: Test _prefIPEnabled infrastructure browsing
+        run: python3 rapportd_ip_browse_test.py 2>&1
