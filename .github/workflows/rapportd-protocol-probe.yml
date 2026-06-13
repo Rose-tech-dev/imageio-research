@@ -126,6 +126,7 @@ jobs:
           ./rapportd_nsxpc_proto_probe 2>&1 || true
 
       - name: Swift RemoteDisplay XPC method probe (remoteDisplay* methods)
+        continue-on-error: true
         run: |
           echo "=== Compiling Swift RemoteDisplay method probe ==="
           swiftc rapportd_remotedisplay_probe.swift -o /tmp/rd_probe 2>&1

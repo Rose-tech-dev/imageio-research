@@ -77,7 +77,8 @@ func probe(service: String, label: String, action: @escaping (RPRemoteDisplayDae
     conn.resume()
 
     let proxy = conn.remoteObjectProxyWithErrorHandler { err in
-        result = "ERROR HANDLER: \(err.localizedDescription) [code=\(err.code) domain=\(err.domain)]"
+        let e = err as NSError
+        result = "ERROR HANDLER: \(e.localizedDescription) [code=\(e.code) domain=\(e.domain)]"
         sema.signal()
     } as? RPRemoteDisplayDaemonXPC
 
