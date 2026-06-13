@@ -6,102 +6,92 @@ on:
 jobs:
   recon:
     runs-on: macos-15
+    timeout-minutes: 30
     steps:
       - name: Install ipsw
         run: |
-          brew install blacktop/tap/ipsw 2>/dev/null || {
-            curl -sLO $(curl -s https://api.github.com/repos/blacktop/ipsw/releases/latest \
-              | python3 -c "import sys,json; assets=json.load(sys.stdin)['assets']; \
-                print([a['browser_download_url'] for a in assets if 'macOS_universal' in a['name'] and a['name'].endswith('.tar.gz') and 'ipsw_' in a['name']][0])")
-            tar -xzf ipsw_*.tar.gz
-            sudo mv ipsw /usr/local/bin/
-          }
+          brew install blacktop/tap/ipsw
           ipsw version
 
-      - name: Get iOS 18.5 IPSW URL (stable, pre-AEA encryption)
-        id: ipsw_url
+      - name: Find iOS 18.5 IPSW URL
+        id: url
         run: |
-          URL=$(ipsw download ipsw --device iPhone16,1 --version 18.5 --urls 2>/dev/null | grep "^http" | head -1)
-          if [ -z "$URL" ]; then
-            URL=$(ipsw download ipsw --device iPhone16,1 --latest --urls 2>/dev/null | grep "^http" | head -1)
-          fi
+          URL=$(ipsw download ipsw --device iPhone16,1 --version 18.5 --urls 2>&1 | grep "^http" | head -1)
           echo "url=$URL" >> $GITHUB_OUTPUT
-          echo "IPSW URL: $URL"
+          echo "URL: $URL"
 
-      - name: Extract dyld shared cache image list (remote - no full download)
+      - name: Download dyld shared cache (arm64e, HTTP range - no full IPSW)
         run: |
-          URL="${{ steps.ipsw_url.outputs.url }}"
-          echo "=== EXTRACTING DYLD IMAGE LIST FROM: $URL ==="
-          ipsw dyld info --remote "$URL" --arch arm64e 2>/dev/null | head -200 || \
-          ipsw dyld info --remote "$URL" 2>/dev/null | head -200 || \
-          echo "Remote dyld info failed - trying alternate method"
+          mkdir -p /tmp/dyld
+          ipsw download ipsw \
+            --device iPhone16,1 \
+            --version 18.5 \
+            --dyld \
+            --arch arm64e \
+            --output /tmp/dyld \
+            --confirm 2>&1 | tail -30
+          echo "=== EXTRACTED ==="
+          find /tmp/dyld -type f | head -20
 
-      - name: Search for mirroring and remote UI images
+      - name: List all images in dyld cache
         run: |
-          URL="${{ steps.ipsw_url.outputs.url }}"
-          echo "=== MIRROR / REMOTE / CONTINUITY IMAGES ==="
-          ipsw dyld info --remote "$URL" --arch arm64e 2>/dev/null | \
-            grep -iE "(mirror|remote|continuity|handoff|phone|screen|display|cast|reflect)" | sort -u || true
-
-      - name: Download only the dyld cache (arm64e slice, remote extraction)
-        run: |
-          mkdir -p /tmp/dyld_out
-          URL="${{ steps.ipsw_url.outputs.url }}"
-          echo "=== EXTRACTING DYLD CACHE (arm64e) ==="
-          ipsw download ipsw --remote-url "$URL" --dyld --dyld-arch arm64e \
-            --output /tmp/dyld_out --confirm 2>&1 | tail -20 || true
-
-      - name: List extracted files
-        run: |
-          echo "=== EXTRACTED FILES ==="
-          find /tmp/dyld_out -type f 2>/dev/null | head -30
-
-      - name: Dump symbols for mirroring-related images
-        run: |
-          CACHE=$(find /tmp/dyld_out -name "dyld_shared_cache_arm64e" 2>/dev/null | head -1)
+          CACHE=$(find /tmp/dyld -name "dyld_shared_cache_arm64e" | head -1)
+          echo "Cache: $CACHE"
           if [ -n "$CACHE" ]; then
-            echo "=== FOUND CACHE: $CACHE ==="
+            echo "=== ALL IMAGES (mirror/remote/continuity/phone/screen) ==="
+            ipsw dyld image "$CACHE" | grep -iE "(mirror|remote|continuity|phone|screen|display|cast)" | sort -u
             echo ""
-            echo "=== MIRROR/REMOTE IMAGES IN CACHE ==="
-            ipsw dyld image "$CACHE" 2>/dev/null | grep -iE "(mirror|remote|continuity|phone|screen)" | sort -u
-            echo ""
-            echo "=== ALL XPC SERVICE IMAGES ==="
-            ipsw dyld image "$CACHE" 2>/dev/null | grep -iE "(xpc|daemon|service)" | sort -u
-          else
-            echo "No cache extracted - searching IPSW filesystem directly"
-            ipsw download ipsw --remote-url "$URL" \
-              --pattern ".*[Mm]irror.*|.*[Rr]emote[Uu][Ii].*|.*[Cc]ontinuity.*" \
-              --output /tmp/pattern_out --confirm 2>&1 | tail -20 || true
-            find /tmp/pattern_out -type f 2>/dev/null
+            echo "=== ALL IMAGES (xpc/service/daemon) ==="
+            ipsw dyld image "$CACHE" | grep -iE "(xpc|daemon|service)" | sort -u
           fi
 
-      - name: Extract entitlements from mirroring binaries
+      - name: Extract entitlements for remote/mirror images
         run: |
-          CACHE=$(find /tmp/dyld_out -name "dyld_shared_cache_arm64e" 2>/dev/null | head -1)
+          CACHE=$(find /tmp/dyld -name "dyld_shared_cache_arm64e" | head -1)
           if [ -n "$CACHE" ]; then
-            echo "=== ENTITLEMENTS FOR MIRROR/REMOTE IMAGES ==="
-            for img in $(ipsw dyld image "$CACHE" 2>/dev/null | grep -iE "(mirror|remote)" | awk '{print $1}'); do
+            echo "=== ENTITLEMENTS ==="
+            for img in $(ipsw dyld image "$CACHE" | grep -iE "(mirror|remote|continuity)" | awk '{print $NF}'); do
               echo "--- $img ---"
               ipsw dyld ent "$CACHE" --image "$img" 2>/dev/null || true
-              echo ""
             done
           fi
 
-      - name: Dump exported symbols for RemoteUI / CoreRemoteUI
+      - name: Dump exports for RemoteUI and CoreRemoteUI
         run: |
-          CACHE=$(find /tmp/dyld_out -name "dyld_shared_cache_arm64e" 2>/dev/null | head -1)
+          CACHE=$(find /tmp/dyld -name "dyld_shared_cache_arm64e" | head -1)
           if [ -n "$CACHE" ]; then
-            echo "=== REMOTEUI EXPORTS ==="
-            ipsw dyld exports "$CACHE" --image RemoteUI 2>/dev/null | head -100 || true
+            echo "=== RemoteUI EXPORTS ==="
+            ipsw dyld exports "$CACHE" --image RemoteUI 2>/dev/null | head -150 || true
             echo ""
-            echo "=== COREREMOTEUI EXPORTS ==="
-            ipsw dyld exports "$CACHE" --image CoreRemoteUI 2>/dev/null | head -100 || true
+            echo "=== CoreRemoteUI EXPORTS ==="
+            ipsw dyld exports "$CACHE" --image CoreRemoteUI 2>/dev/null | head -150 || true
+            echo ""
+            echo "=== Continuity EXPORTS ==="
+            ipsw dyld exports "$CACHE" | grep -iE "mirror|handoff|phone" | head -100 || true
           fi
 
-      - name: Save results as artifact
+      - name: Pattern search - if dyld failed, extract binaries directly
+        if: always()
+        run: |
+          if ! find /tmp/dyld -name "dyld_shared_cache_arm64e" | grep -q .; then
+            echo "=== DYLD CACHE NOT EXTRACTED - TRYING PATTERN MATCH ==="
+            mkdir -p /tmp/pattern
+            ipsw download ipsw \
+              --device iPhone16,1 \
+              --version 18.5 \
+              --pattern ".*[Mm]irror.*|.*[Rr]emoteUI.*|.*[Cc]ontinuity.*|.*[Pp]hone[Mm]irroring.*" \
+              --output /tmp/pattern \
+              --confirm 2>&1 | tail -20 || true
+            find /tmp/pattern -type f
+          fi
+
+      - name: Upload results
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: ios-mirroring-recon
-          path: /tmp/dyld_out/
+          name: ios-mirroring-results
+          path: |
+            /tmp/dyld/
+            /tmp/pattern/
           retention-days: 7
+          if-no-files-found: warn
