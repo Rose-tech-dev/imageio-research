@@ -192,6 +192,13 @@ def main():
     # ================================================================
     print("\n[3d] Advertising _rdlink._tcp WITH bypass pref enabled", flush=True)
 
+    # Make sure previous server socket is closed
+    try:
+        server_sock.close()
+    except Exception:
+        pass
+    time.sleep(1)
+
     server_sock2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_sock2.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_sock2.bind(('0.0.0.0', 9998))
