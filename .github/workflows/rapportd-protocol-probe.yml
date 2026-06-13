@@ -139,9 +139,34 @@ jobs:
       - name: Check rapportd logs after probe
         continue-on-error: true
         run: |
-          echo "=== rapportd logs (last 30s) ==="
+          echo "=== rapportd logs (last 30s, head -300 to capture Swift probe logs) ==="
           log show --predicate 'process == "rapportd"' --last 30s 2>/dev/null | \
-            grep -vE "(WiFiManagerClient|Logging)" | head -80 || true
+            grep -vE "^\s+[0-9]+\s+(CoreFoundation|libobjc|Foundation|libxpc|libdispatch|libsystem)" | \
+            grep -vE "(WiFiManagerClient|Logging)" | head -300 || true
+
+      - name: Focused probe - remoteDisplayChangeDedicatedDevice 6s wait + log capture
+        continue-on-error: true
+        run: |
+          PROBE_START=$(date -u "+%Y-%m-%d %H:%M:%S")
+          echo "=== Probe start time: $PROBE_START ==="
+          echo ""
+
+          echo "=== Compiling focused ChangeDedicatedDevice probe ==="
+          swiftc rapportd_changededicated_probe.swift -o /tmp/rd_focused 2>&1
+          echo "Compile exit: $?"
+
+          echo ""
+          echo "=== Running focused probe (primary: 6s full wait on remoteDisplayChangeDedicatedDevice:nil) ==="
+          /tmp/rd_focused 2>&1 || true
+
+          echo ""
+          echo "=== rapportd logs from probe window (start=$PROBE_START, stack frames filtered) ==="
+          log show \
+            --predicate 'process == "rapportd"' \
+            --start "$PROBE_START" \
+            2>/dev/null | \
+            grep -vE "^\s+[0-9]+\s+(CoreFoundation|libobjc|Foundation|libxpc|libdispatch|libsystem)" | \
+            head -250 || true
 
       - name: Entitlement check probing - SecTaskCopyValueForEntitlement
         run: |
