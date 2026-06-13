@@ -114,6 +114,7 @@ jobs:
           ls /System/Volumes/Preboot/Cryptexes/OS/usr/lib/dyld_shared_cache* 2>/dev/null | head -5 || echo "(not accessible)"
 
       - name: Compile and run NSXPCProxy protocol probe
+        continue-on-error: true
         run: |
           echo "=== Compiling NSXPCProxy protocol probe ==="
           clang -o rapportd_nsxpc_proto_probe rapportd_nsxpc_proto_probe.m \
@@ -123,6 +124,16 @@ jobs:
           echo ""
           echo "=== Running probe ==="
           ./rapportd_nsxpc_proto_probe 2>&1 || true
+
+      - name: Swift RemoteDisplay XPC method probe (remoteDisplay* methods)
+        run: |
+          echo "=== Compiling Swift RemoteDisplay method probe ==="
+          swiftc rapportd_remotedisplay_probe.swift -o /tmp/rd_probe 2>&1
+          echo "Compile exit: $?"
+
+          echo ""
+          echo "=== Running RemoteDisplay method probe ==="
+          /tmp/rd_probe 2>&1 || true
 
       - name: Check rapportd logs after probe
         continue-on-error: true
