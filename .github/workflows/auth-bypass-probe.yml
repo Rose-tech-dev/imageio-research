@@ -1,0 +1,114 @@
+name: rapportd Auth Bypass Probe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Probe rapportd auth bypass vectors
+        run: python3 auth_bypass_probe.py
+
+      - name: Deep rapportd string analysis - auth tag and identity formats
+        run: |
+          RAPPORT="/usr/libexec/rapportd"
+
+          echo "=== AUTH TAG AND BONJOUR TXT RECORD KEYS ==="
+          strings "$RAPPORT" 2>/dev/null | grep -iE "^(rpfl|rphi|rpha|rpba|rpld|rpmd|rpcd|rpid|rpot|rpsn|rphn|rpMd|rpMI|rpvr|rpFt|rpHN|rpAD|rpMac)" | sort -u | head -40
+
+          echo ""
+          echo "=== DISCOVERY NONCE STRINGS ==="
+          strings "$RAPPORT" 2>/dev/null | grep -iE "(nonce|Nonce|NONCE|discovery.nonce|rotate|roll)" | sort -u | head -20
+
+          echo ""
+          echo "=== IDENTITY PROTOCOL STRINGS ==="
+          strings "$RAPPORT" 2>/dev/null | grep "RPLocalIdentityProtocol" | sort -u
+
+          echo ""
+          echo "=== SIGNATURE STRINGS ==="
+          strings "$RAPPORT" 2>/dev/null | grep -iE "(signature|sign|Signature|HMAC|hmac|mac|MAC|tag|Tag)" | sort -u | head -30
+
+          echo ""
+          echo "=== CRYPTO ALGORITHM STRINGS ==="
+          strings "$RAPPORT" 2>/dev/null | grep -iE "(secp256|P-256|Ed25519|X25519|curve25519|P256|ecdsa|ecdh|sha256|sha512|aes.gcm|chacha20|poly1305)" | sort -u | head -30
+
+          echo ""
+          echo "=== VERSION AND PROTOCOL NEGOTIATION ==="
+          strings "$RAPPORT" 2>/dev/null | grep -iE "(version|proto|protocol|negotiate|handshake|hello|welcome|HELLO|WELCOME)" | sort -u | head -30
+
+          echo ""
+          echo "=== RAPPORTD ADVERTISED BONJOUR SERVICE ==="
+          # Check what rapportd registers with mDNSResponder
+          timeout 10 dns-sd -B _rdlink._tcp . 2>/dev/null || true
+          echo ""
+          timeout 10 dns-sd -B _companion-link._tcp . 2>/dev/null || true
+
+      - name: Probe NearbyAction V2 BLE advertisement format
+        run: |
+          RAPPORT="/usr/libexec/rapportd"
+
+          echo "=== NearbyAction V2 STRINGS ==="
+          strings "$RAPPORT" 2>/dev/null | grep -iE "(NearbyAction|NearbyInfo|nearby.action|RPNear|nearby.v2|ActionV2|InfoV2)" | sort -u | head -40
+
+          echo ""
+          echo "=== BLE ADVERTISEMENT DATA FORMAT ==="
+          strings "$RAPPORT" 2>/dev/null | grep -iE "(advertisement|advert|BLE|ble|bluetooth|BTAddress|bt.address|btAddress)" | sort -u | head -40
+
+          echo ""
+          echo "=== COMPANION LINK AND DEVICE RECOGNITION ==="
+          strings "$RAPPORT" 2>/dev/null | grep -iE "(recognize|recognition|known|paired|known.device|PublicID|publicID|deviceID|deviceId)" | sort -u | head -30
+
+          echo ""
+          echo "=== AWDL PAIRING SESSION STRINGS ==="
+          strings "$RAPPORT" 2>/dev/null | grep -iE "(AWDLPairing|awdl.pair|AWDL.session|awdlSession|awdlPairing)" | sort -u | head -20
+
+          echo ""
+          echo "=== THE ACTUAL _serverBonjourAuthTagString METHOD CONTEXT ==="
+          strings "$RAPPORT" 2>/dev/null | grep -A2 -B2 "BonjourAuthTag" | sort -u | head -20 || true
+          # Look for the auth tag value format (hex, base64, etc.)
+          strings "$RAPPORT" 2>/dev/null | grep -iE "(authTag|auth.tag|AuthTag|auth.string|authString)" | sort -u | head -20
+
+      - name: Check rapportd system logs for discovery events
+        run: |
+          echo "=== RAPPORTD LOG LEVEL SETTINGS ==="
+          log config --status 2>/dev/null | grep rapportd | head -5 || true
+
+          echo ""
+          echo "=== ENABLE RAPPORTD DEBUG LOGGING ==="
+          sudo log config --subsystem com.apple.rapportd --mode level:debug 2>/dev/null || true
+
+          echo ""
+          echo "=== TRIGGER DISCOVERY AND OBSERVE ==="
+          # Advertise _rdlink._tcp and watch rapportd logs very carefully
+          dns-sd -R "ProbeDevice" _rdlink._tcp local 9999 rpfl=98304 &
+          DNS_PID=$!
+          sleep 8
+          kill $DNS_PID 2>/dev/null
+
+          echo ""
+          echo "=== rapportd LOGS DURING DISCOVERY ==="
+          log show --predicate 'process == "rapportd"' --last 15s 2>/dev/null | head -80 || true
+
+      - name: Enumerate all network-related Mach services rapportd uses
+        run: |
+          echo "=== RAPPORTD MACH SERVICES (lsof) ==="
+          rapport_pid=$(pgrep rapportd | head -1)
+          if [ -n "$rapport_pid" ]; then
+            lsof -p "$rapport_pid" 2>/dev/null | head -60
+          fi
+
+          echo ""
+          echo "=== RAPPORTD NETWORK CONNECTIONS ==="
+          if [ -n "$rapport_pid" ]; then
+            lsof -p "$rapport_pid" -i 2>/dev/null | head -30
+          fi
+
+          echo ""
+          echo "=== RAPPORTD OPEN FILES ==="
+          if [ -n "$rapport_pid" ]; then
+            lsof -p "$rapport_pid" 2>/dev/null | grep -v "mem\|txt\|cwd\|rtd" | head -40
+          fi
