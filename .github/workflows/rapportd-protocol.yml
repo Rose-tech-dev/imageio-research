@@ -1,0 +1,102 @@
+name: rapportd Protocol Analysis
+
+on:
+  workflow_dispatch:
+
+jobs:
+  analyze:
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - name: rapportd network framer and protocol strings
+        run: |
+          RAPPORT="/usr/libexec/rapportd"
+
+          echo "=== ALL OBJC CLASSES IN rapportd ==="
+          strings "$RAPPORT" 2>/dev/null | grep -E "^RP[A-Z]|^_RP[A-Z]" | sort -u | head -100
+
+          echo ""
+          echo "=== NETWORK/FRAMER/CONNECTION STRINGS ==="
+          strings "$RAPPORT" 2>/dev/null | grep -iE "(frame|framer|network|connect|socket|listen|bind|port|tcp|udp|awdl|bonjour|mdns|nw_)" | sort -u | head -100
+
+          echo ""
+          echo "=== BONJOUR SERVICE TYPES ==="
+          strings "$RAPPORT" 2>/dev/null | grep -E "_[a-z].*\._tcp|_[a-z].*\._udp" | sort -u | head -30
+
+          echo ""
+          echo "=== _prefIgnoreRemoteDisplayChecks ==="
+          strings "$RAPPORT" 2>/dev/null | grep -i "pref\|Ignore\|Check\|bypass\|disable\|override" | sort -u | head -60
+
+          echo ""
+          echo "=== PAIRING/AUTH PROTOCOL STRINGS ==="
+          strings "$RAPPORT" 2>/dev/null | grep -iE "(SRP|DH|ECDH|secp|curve|nonce|hmac|sha|aes|gcm|chacha|pairing|challenge|response|handshake|verify|credential|identity|sign|certif)" | sort -u | head -80
+
+          echo ""
+          echo "=== ERROR/FAILURE MESSAGES ==="
+          strings "$RAPPORT" 2>/dev/null | grep -iE "(failed|error|invalid|corrupt|overflow|underflow|out of|too large|malformed|unexpected)" | sort -u | head -60
+
+      - name: rapportd ObjC class methods - pairing and RemoteDisplay
+        run: |
+          RAPPORT="/usr/libexec/rapportd"
+          echo "=== ALL RPRemoteDisplay* METHODS ==="
+          strings "$RAPPORT" 2>/dev/null | grep "RPRemoteDisplay" | sort -u
+
+          echo ""
+          echo "=== ALL RPPairing* AND RPSession* METHODS ==="
+          strings "$RAPPORT" 2>/dev/null | grep -E "RPPairing|RPSession|RPAuthenticat|RPIdentity|RPDevice" | sort -u
+
+          echo ""
+          echo "=== ALL parse* AND decode* AND unpack* METHODS ==="
+          strings "$RAPPORT" 2>/dev/null | grep -iE "(parse|decode|unpack|deserializ|unmarshal|receiv|incom|handle)" | sort -u | head -80
+
+          echo ""
+          echo "=== FULL UNIQUE STRING LIST >15 chars ==="
+          strings "$RAPPORT" 2>/dev/null | awk 'length > 15' | sort -u | grep -v "^<\|^{\|^[0-9]\|\.apple\.\|NSObject\|^_[A-Z]" | head -200
+
+      - name: iOS Simulator dyld cache - iPhone Mirroring server side
+        run: |
+          echo "=== iOS 18.5 SIMULATOR DYLD CACHE ==="
+          IOS_CACHE=$(find /Library/Developer/CoreSimulator/Caches/dyld -name "dyld_sim_shared_cache_arm64" 2>/dev/null | grep "iOS-18-5\|iOS-18" | head -1)
+          echo "iOS cache: $IOS_CACHE"
+          if [ -n "$IOS_CACHE" ]; then
+            echo ""
+            echo "=== MIRROR/REMOTE IMAGES IN iOS CACHE ==="
+            ipsw dyld image "$IOS_CACHE" 2>/dev/null | grep -iE "(mirror|remote|replicat|screen|continuity|rapport)" | sort -u | head -40
+          fi
+
+          echo ""
+          echo "=== iOS 26 SIMULATOR CACHE ==="
+          IOS26_CACHE=$(find /Library/Developer/CoreSimulator/Caches/dyld -name "dyld_sim_shared_cache_arm64" 2>/dev/null | grep "iOS-26" | head -1)
+          echo "iOS 26 cache: $IOS26_CACHE"
+          if [ -n "$IOS26_CACHE" ]; then
+            ipsw dyld image "$IOS26_CACHE" 2>/dev/null | grep -iE "(mirror|remote|replicat|screen|continuity|rapport)" | sort -u | head -40
+          fi
+
+      - name: Find rapportd sandbox profile
+        run: |
+          echo "=== RAPPORTD SANDBOX ==="
+          cat /System/Library/Sandbox/Profiles/rapportd.sb 2>/dev/null | head -150 || \
+          find /System/Library/Sandbox -name "*rapport*" 2>/dev/null | head -5
+
+          echo ""
+          echo "=== NETWORK ENTITLEMENT FOR COM.APPLE.REMOTEDISPLAY ==="
+          # rapportd registers com.apple.RemoteDisplay
+          # Check who CAN CONNECT to it besides iPhone Mirroring
+          grep -r "RemoteDisplay\|rapport.remote" \
+            /System/Library/LaunchDaemons \
+            /System/Library/LaunchAgents \
+            /System/Library/Sandbox/Profiles \
+            2>/dev/null | grep -v "Binary\|.plist:" | head -20
+
+      - name: wifip2pd protocol - the Wi-Fi transport for mirroring
+        run: |
+          echo "=== wifip2pd STRINGS ==="
+          strings /usr/libexec/wifip2pd 2>/dev/null | sort -u | head -200
+
+          echo ""
+          echo "=== wifip2pd ENTITLEMENTS ==="
+          codesign -d --entitlements :- /usr/libexec/wifip2pd 2>/dev/null || true
+
+          echo ""
+          echo "=== wifip2pd ERROR STRINGS ==="
+          strings /usr/libexec/wifip2pd 2>/dev/null | grep -iE "(error|fail|invalid|overflow|corrupt|too large|length|size|buffer)" | sort -u | head -60
