@@ -1,0 +1,142 @@
+name: rapportd Security Bypass v2
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: rapportd full entitlements dump
+        run: |
+          echo "=== rapportd FULL ENTITLEMENTS ==="
+          codesign -d --entitlements - /usr/libexec/rapportd 2>/dev/null
+          echo ""
+          echo "=== rapportd entitlements via security tool ==="
+          security cms -D -i /usr/libexec/rapportd 2>/dev/null || true
+
+      - name: Check rapportd preferences architecture
+        run: |
+          echo "=== rapportd preference strings ==="
+          strings /usr/libexec/rapportd 2>/dev/null | grep -iE "^_pref" | sort -u
+
+          echo ""
+          echo "=== NSUserDefaults usage in rapportd ==="
+          strings /usr/libexec/rapportd 2>/dev/null | grep -iE "(NSUserDefaults|CFPreferences|defaultsObjectForKey|boolForKey|objectForKey)" | sort -u | head -20
+
+          echo ""
+          echo "=== rapportd all preference domain checks ==="
+          # rapportd might read from multiple domains:
+          # - com.apple.rapportd (user)
+          # - com.apple.rapportd (system, /Library/Preferences)
+          # Check if any system-level preference file exists
+          ls -la /Library/Preferences/com.apple.rapportd* 2>/dev/null || echo "(no system prefs)"
+          ls -la ~/Library/Preferences/com.apple.rapportd* 2>/dev/null || echo "(no user prefs)"
+
+          echo ""
+          echo "=== rapportd LaunchDaemon plist ==="
+          cat /System/Library/LaunchDaemons/com.apple.rapportd.plist 2>/dev/null || echo "(not found)"
+          cat /Library/LaunchDaemons/com.apple.rapportd.plist 2>/dev/null || echo "(not found)"
+
+      - name: Run preference bypass probe
+        run: |
+          python3 pref_bypass_probe.py 2>&1
+
+      - name: Deep pref bypass analysis - check if rapportd reacts
+        run: |
+          echo "=== Write _prefIgnoreRemoteDisplayChecks and watch rapportd ==="
+
+          # Write the pref
+          defaults write com.apple.rapportd _prefIgnoreRemoteDisplayChecks -bool YES
+          echo "Written. Current prefs:"
+          defaults read com.apple.rapportd 2>/dev/null || echo "(not readable)"
+
+          echo ""
+          echo "=== Advertise _rdlink._tcp with bypass pref active ==="
+          # Start listener in background
+          python3 -c "
+import socket, sys, time, subprocess
+
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('0.0.0.0', 9997))
+s.listen(5)
+s.settimeout(12)
+print('Listening on 9997', flush=True)
+
+# Advertise
+proc = subprocess.Popen(
+    ['dns-sd', '-R', 'BypassTest3', '_rdlink._tcp', 'local', '9997',
+     'rpFl=98304', 'rpHI=TestHI', 'rpHN=TestHN', 'rpHA=bypass_test',
+     'rpMd=iPhone16,2', 'rpVr=1.0'],
+    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+)
+time.sleep(2)
+print('Advertised. Waiting for connection...', flush=True)
+
+try:
+    conn, addr = s.accept()
+    print('CONNECTION from %s:%d' % addr, flush=True)
+    data = conn.recv(4096)
+    print('Data: %s' % data.hex(), flush=True)
+    conn.close()
+except socket.timeout:
+    print('No connection (timeout)', flush=True)
+finally:
+    proc.terminate()
+    s.close()
+" 2>&1
+
+          echo ""
+          echo "=== rapportd logs after bypass test ==="
+          log show --predicate 'process == "rapportd"' --last 30s 2>/dev/null \
+            | grep -vE "WiFiManagerClient" | head -40 || true
+
+          # Cleanup
+          defaults delete com.apple.rapportd _prefIgnoreRemoteDisplayChecks 2>/dev/null || true
+
+      - name: Test SIGHUP vs restart behavior
+        run: |
+          echo "=== Test: Does SIGHUP force rapportd to re-read prefs? ==="
+          rapport_pid=$(pgrep rapportd | head -1)
+          echo "Before SIGHUP: PID=$rapport_pid"
+
+          defaults write com.apple.rapportd _prefIgnoreRemoteDisplayChecks -bool YES
+
+          kill -HUP "$rapport_pid" 2>/dev/null || true
+          sleep 2
+
+          new_pid=$(pgrep rapportd | head -1)
+          echo "After SIGHUP: PID=$new_pid"
+
+          echo ""
+          echo "=== rapportd logs for pref-related messages ==="
+          log show --predicate 'process == "rapportd"' --last 10s 2>/dev/null \
+            | grep -iE "(pref|prefIgnore|ignore|bypass|check|security)" | head -20 || true
+
+          # Cleanup
+          defaults delete com.apple.rapportd _prefIgnoreRemoteDisplayChecks 2>/dev/null || true
+
+      - name: Enumerate rapportd XPC services reachable by user
+        run: |
+          echo "=== rapportd XPC services registered ==="
+          launchctl dumpstate 2>/dev/null | grep -B5 -A20 "rapportd" | head -100 || true
+
+          echo ""
+          echo "=== Can a user process connect to com.apple.rapportd XPC? ==="
+          # Try to connect as unprivileged user
+          python3 -c "
+import ctypes, sys
+libc = ctypes.CDLL(None)
+print('Trying XPC connection to com.apple.rapportd...', flush=True)
+# Note: We can test this with xpc_connection_create
+" 2>&1 || true
+
+          echo ""
+          echo "=== Check com.apple.rapport.matching sandbox restrictions ==="
+          # What processes are allowed to connect to rapport.matching?
+          # Look at LaunchDaemon plist for MachServices entitlements
+          plutil -convert json -o - /System/Library/LaunchDaemons/com.apple.rapportd.plist 2>/dev/null || true
