@@ -1,0 +1,62 @@
+name: rapportd rpHA TXT Record Fuzzer
+
+on:
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enable rapportd debug logging
+        run: |
+          echo "=== rapportd PID ==="
+          pgrep -la rapportd
+          echo ""
+          echo "=== Enable debug logging ==="
+          sudo log config --subsystem com.apple.rapport --mode level:debug 2>/dev/null || true
+
+      - name: Run rpHA fuzzer
+        run: |
+          python3 rpha_fuzzer.py 2>&1
+
+      - name: Post-fuzz rapportd analysis
+        run: |
+          echo "=== rapportd STATUS ==="
+          pgrep -la rapportd || echo "rapportd NOT FOUND"
+
+          echo ""
+          echo "=== CRASH REPORTS ==="
+          ls ~/Library/Logs/DiagnosticReports/ 2>/dev/null | grep -i rapport || echo "none"
+          ls /Library/Logs/DiagnosticReports/ 2>/dev/null | grep -i rapport || echo "none"
+
+          echo ""
+          echo "=== rapportd LOGS DURING FUZZING ==="
+          log show --predicate 'process == "rapportd"' --last 5m 2>/dev/null \
+            | grep -iE "(ProbeDevice|rpHA|rpHI|rpHN|rpFl|signature|identity|resolve|error|fail|crash|OOB|overflow|invalid)" \
+            | head -100 || true
+
+          echo ""
+          echo "=== SYSTEM LOG ERRORS ==="
+          log show --last 5m 2>/dev/null \
+            | grep -iE "(rapportd|rapport)" \
+            | grep -iE "(error|fault|crash|exception|panic|killed)" \
+            | head -30 || true
+
+      - name: Check for rapportd memory anomalies
+        run: |
+          rapport_pid=$(pgrep rapportd | head -1)
+          if [ -n "$rapport_pid" ]; then
+            echo "=== rapportd MEMORY MAP ==="
+            vmmap -summary "$rapport_pid" 2>/dev/null | head -30 || true
+
+            echo ""
+            echo "=== rapportd FD COUNT ==="
+            ls -la /proc/$rapport_pid/fd 2>/dev/null | wc -l || lsof -p "$rapport_pid" 2>/dev/null | wc -l
+
+            echo ""
+            echo "=== rapportd THREADS ==="
+            ps -M -p "$rapport_pid" 2>/dev/null | head -20 || true
+          fi
