@@ -29,17 +29,12 @@ jobs:
 
           echo ""
           echo "=== rapportd all preference domain checks ==="
-          # rapportd might read from multiple domains:
-          # - com.apple.rapportd (user)
-          # - com.apple.rapportd (system, /Library/Preferences)
-          # Check if any system-level preference file exists
           ls -la /Library/Preferences/com.apple.rapportd* 2>/dev/null || echo "(no system prefs)"
           ls -la ~/Library/Preferences/com.apple.rapportd* 2>/dev/null || echo "(no user prefs)"
 
           echo ""
           echo "=== rapportd LaunchDaemon plist ==="
-          cat /System/Library/LaunchDaemons/com.apple.rapportd.plist 2>/dev/null || echo "(not found)"
-          cat /Library/LaunchDaemons/com.apple.rapportd.plist 2>/dev/null || echo "(not found)"
+          plutil -convert json -o - /System/Library/LaunchDaemons/com.apple.rapportd.plist 2>/dev/null || echo "(not found)"
 
       - name: Run preference bypass probe
         run: |
@@ -49,14 +44,12 @@ jobs:
         run: |
           echo "=== Write _prefIgnoreRemoteDisplayChecks and watch rapportd ==="
 
-          # Write the pref
           defaults write com.apple.rapportd _prefIgnoreRemoteDisplayChecks -bool YES
           echo "Written. Current prefs:"
           defaults read com.apple.rapportd 2>/dev/null || echo "(not readable)"
 
           echo ""
           echo "=== Advertise _rdlink._tcp with bypass pref active ==="
-          # Start listener in background
           python3 -c "
 import socket, sys, time, subprocess
 
@@ -67,7 +60,6 @@ s.listen(5)
 s.settimeout(12)
 print('Listening on 9997', flush=True)
 
-# Advertise
 proc = subprocess.Popen(
     ['dns-sd', '-R', 'BypassTest3', '_rdlink._tcp', 'local', '9997',
      'rpFl=98304', 'rpHI=TestHI', 'rpHN=TestHN', 'rpHA=bypass_test',
@@ -95,29 +87,6 @@ finally:
           log show --predicate 'process == "rapportd"' --last 30s 2>/dev/null \
             | grep -vE "WiFiManagerClient" | head -40 || true
 
-          # Cleanup
-          defaults delete com.apple.rapportd _prefIgnoreRemoteDisplayChecks 2>/dev/null || true
-
-      - name: Test SIGHUP vs restart behavior
-        run: |
-          echo "=== Test: Does SIGHUP force rapportd to re-read prefs? ==="
-          rapport_pid=$(pgrep rapportd | head -1)
-          echo "Before SIGHUP: PID=$rapport_pid"
-
-          defaults write com.apple.rapportd _prefIgnoreRemoteDisplayChecks -bool YES
-
-          kill -HUP "$rapport_pid" 2>/dev/null || true
-          sleep 2
-
-          new_pid=$(pgrep rapportd | head -1)
-          echo "After SIGHUP: PID=$new_pid"
-
-          echo ""
-          echo "=== rapportd logs for pref-related messages ==="
-          log show --predicate 'process == "rapportd"' --last 10s 2>/dev/null \
-            | grep -iE "(pref|prefIgnore|ignore|bypass|check|security)" | head -20 || true
-
-          # Cleanup
           defaults delete com.apple.rapportd _prefIgnoreRemoteDisplayChecks 2>/dev/null || true
 
       - name: Enumerate rapportd XPC services reachable by user
@@ -126,17 +95,7 @@ finally:
           launchctl dumpstate 2>/dev/null | grep -B5 -A20 "rapportd" | head -100 || true
 
           echo ""
-          echo "=== Can a user process connect to com.apple.rapportd XPC? ==="
-          # Try to connect as unprivileged user
-          python3 -c "
-import ctypes, sys
-libc = ctypes.CDLL(None)
-print('Trying XPC connection to com.apple.rapportd...', flush=True)
-# Note: We can test this with xpc_connection_create
-" 2>&1 || true
-
-          echo ""
-          echo "=== Check com.apple.rapport.matching sandbox restrictions ==="
-          # What processes are allowed to connect to rapport.matching?
-          # Look at LaunchDaemon plist for MachServices entitlements
-          plutil -convert json -o - /System/Library/LaunchDaemons/com.apple.rapportd.plist 2>/dev/null || true
+          echo "=== rapportd sandbox profile ==="
+          sandbox-exec -f /dev/null echo "sandbox-exec available" 2>/dev/null || true
+          ls /System/Library/Sandbox/Profiles/ 2>/dev/null | grep rapport | head -5 || echo "(no rapport sandbox profiles in standard location)"
+          find /System/Library -name "*rapport*" 2>/dev/null | head -10 || true
