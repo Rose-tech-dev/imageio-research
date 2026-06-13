@@ -1,0 +1,133 @@
+name: rdlink Auth Protocol Deep Dive
+
+on:
+  workflow_dispatch:
+
+jobs:
+  analyze:
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - name: wifip2pd auth binary format - frame types and magic bytes
+        run: |
+          WP="/usr/libexec/wifip2pd"
+
+          echo "=== ALL STRING CONSTANTS >8 chars (authentication focus) ==="
+          strings "$WP" 2>/dev/null | awk 'length > 8' | grep -iE "(auth|token|nonce|pubkey|public.key|private.key|sign|verif|hash|hmac|sha|ecdh|secp|shared.secret|request|response|frame|parse|length|size|offset|bytes|header|magic|version|type|TLV|tag)" | sort -u | head -100
+
+          echo ""
+          echo "=== FRAME/PACKET STRUCTURE STRINGS ==="
+          strings "$WP" 2>/dev/null | grep -iE "(frame.type|frame.len|frame.length|packet.type|msg.type|message.type|header|TLV|type-length|length-value|payload|body|data)" | sort -u | head -50
+
+          echo ""
+          echo "=== SPECIFIC AUTH TOKEN AND KEY STRINGS ==="
+          strings "$WP" 2>/dev/null | grep -iE "(token|public.key|shared.secret|salt|kdf|derive|HKDF|PBKDF)" | sort -u | head -40
+
+          echo ""
+          echo "=== ERROR STRINGS with length/size/overflow ==="
+          strings "$WP" 2>/dev/null | grep -iE "(too.long|too.large|too.short|out.of.bounds|overflow|underflow|invalid.length|invalid.size|truncat|unexpected.end|malform|corrupt)" | sort -u | head -40
+
+          echo ""
+          echo "=== ALL CLASS/STRUCT NAMES from nm ==="
+          nm -g "$WP" 2>/dev/null | grep " T \| t " | sed 's/.* //' | sort -u | head -150 || true
+
+      - name: ScreenContinuityServices - session protocol and frame handling
+        run: |
+          SCS="/System/Library/PrivateFrameworks/ScreenContinuityServices.framework/ScreenContinuityServices"
+
+          echo "=== ENTITLEMENTS ==="
+          codesign -d --entitlements :- "$SCS" 2>/dev/null || true
+
+          echo ""
+          echo "=== XPC/MACH SERVICE NAMES ==="
+          strings "$SCS" 2>/dev/null | grep -E "^com\.apple\." | sort -u | head -60
+
+          echo ""
+          echo "=== FRAME/PROTOCOL STRINGS ==="
+          strings "$SCS" 2>/dev/null | grep -iE "(frame|framer|session|connect|protocol|message|header|payload|length|parse|decode|receiv|send|dispatch)" | sort -u | head -80
+
+          echo ""
+          echo "=== AUTH/SECURITY STRINGS ==="
+          strings "$SCS" 2>/dev/null | grep -iE "(auth|token|sign|verif|cert|key|trust|nonce|challenge)" | sort -u | head -60
+
+          echo ""
+          echo "=== ERROR/FAILURE STRINGS ==="
+          strings "$SCS" 2>/dev/null | grep -iE "(error|fail|invalid|overflow|corrupt|malform|unexpected|too large|too long)" | sort -u | head -40
+
+          echo ""
+          echo "=== ALL ObjC METHODS from nm ==="
+          nm -g "$SCS" 2>/dev/null | grep " T " | sed 's/.* //' | sort -u | head -200 || true
+
+      - name: _rdlink._tcp TXT record format - what rapportd puts in TXT records
+        run: |
+          RAPPORT="/usr/libexec/rapportd"
+
+          echo "=== TXT RECORD KEYS in rapportd ==="
+          strings "$RAPPORT" 2>/dev/null | grep -iE "(txt|TXT|record|key=|=value|btree|PID|wombat|version|rpfl|rpba|rpmd|rphi|rpha|pfl|ba|md|hi)" | sort -u | head -60
+
+          echo ""
+          echo "=== BONJOUR TXT KEYS (short key patterns typical of mDNS) ==="
+          strings "$RAPPORT" 2>/dev/null | grep -E "^[a-z]{2,6}$|^[a-z]{2,8}=[" | sort -u | head -40
+
+          echo ""
+          echo "=== _rdlink specific strings ==="
+          strings "$RAPPORT" 2>/dev/null | grep -iE "rdlink|remote.display|wombat|RPRemoteDisplay" | sort -u | head -40
+
+          echo ""
+          echo "=== rapportd SANDBOX PROFILE (full) ==="
+          find /System/Library/Sandbox/Profiles -name "*rapport*" 2>/dev/null | while read f; do
+            echo "--- $f ---"
+            cat "$f" 2>/dev/null | head -200
+          done
+
+          echo ""
+          echo "=== rapportd ALLOWED NETWORK OPERATIONS ==="
+          find /System/Library/Sandbox/Profiles -name "*rapport*" 2>/dev/null | while read f; do
+            grep -i "network\|connect\|listen\|bind\|socket\|mDNS\|bonjour" "$f" 2>/dev/null | head -30
+          done
+
+      - name: iOS Simulator frameworks - iPhone side of _rdlink protocol
+        run: |
+          echo "=== FIND iOS SIMULATOR CACHES ==="
+          find /Library/Developer/CoreSimulator -name "dyld_shared_cache_arm64*" 2>/dev/null | head -5
+          find /Library/Developer/CoreSimulator -name "dyld_shared_cache_x86_64*" 2>/dev/null | head -5
+
+          echo ""
+          echo "=== LOOK FOR RAPPORT/REMOTE DISPLAY IN SIM FRAMEWORKS ==="
+          find /Library/Developer/CoreSimulator/Profiles/Runtimes -name "*.framework" 2>/dev/null | grep -iE "(rapport|replicat|screen.continuity|remote.display|Wombat)" | head -20
+
+          echo ""
+          echo "=== IPSW TOOL CHECK ==="
+          which ipsw 2>/dev/null || echo "ipsw not available"
+          ipsw version 2>/dev/null || true
+
+          echo ""
+          echo "=== SIM RUNTIME PATHS ==="
+          ls /Library/Developer/CoreSimulator/Profiles/Runtimes/ 2>/dev/null | head -10
+
+      - name: rapportd RPNWFramer - the actual network parser
+        run: |
+          RAPPORT="/usr/libexec/rapportd"
+
+          echo "=== RPNWFramer ALL METHODS ==="
+          strings "$RAPPORT" 2>/dev/null | grep "RPNWFramer\|RPNWNetwork\|RPNWConnection\|RPNWPeer\|RPNWEndpoint" | sort -u
+
+          echo ""
+          echo "=== RPNW DATA RECEIVED LOGGING ==="
+          strings "$RAPPORT" 2>/dev/null | grep "DATA\|data\|receiv\|RPNW" | grep -v "^_\|^@\|\.apple\." | sort -u | head -40
+
+          echo ""
+          echo "=== FRAME TYPE CONSTANTS ==="
+          strings "$RAPPORT" 2>/dev/null | grep -iE "(frameType|frame_type|msgType|msg_type|kFrame|kMsg|kType|kCommand|CommandType)" | sort -u | head -40
+
+          echo ""
+          echo "=== VERSION STRING AND PROTOCOL VERSION ==="
+          strings "$RAPPORT" 2>/dev/null | grep -iE "(version|proto.ver|protocol.version|RPLocalIdentityProtocol)" | sort -u | head -30
+
+          echo ""
+          echo "=== BUFFER SIZE CHECKS IN rapportd ==="
+          strings "$RAPPORT" 2>/dev/null | grep -iE "(maxLength|max.length|maxSize|max.size|bufferSize|buffer.size|kMax|limit|threshold)" | sort -u | head -40
+
+          echo ""
+          echo "=== ALL ObjC CLASS NAMES (full list) ==="
+          strings "$RAPPORT" 2>/dev/null | grep -E "^RP[A-Z]" | sort -u
