@@ -135,37 +135,29 @@ import Foundation
 
 // ──────────────────────────────────────────────────────────────
 // Probe helper — 10s wait (longer: some methods may have latency)
+// Uses AnyObject proxy to avoid Swift generic/Protocol bridging issues.
+// Each action closure performs its own cast inside.
 // ──────────────────────────────────────────────────────────────
-func deepProbe<T: NSObjectProtocol>(service: String, proto: T.Type,
-                                     actions: [(String, (T, DispatchSemaphore) -> Void)]) {
+func deepProbe(service: String, proto: Protocol,
+               actions: [(String, (AnyObject, DispatchSemaphore) -> Void)]) {
     print("\n=== Deep probe: \(service) ===")
     let conn = NSXPCConnection(machServiceName: service, options: [])
     conn.remoteObjectInterface = NSXPCInterface(with: proto)
 
     var connected = false
-    let connSema = DispatchSemaphore(value: 0)
 
     conn.invalidationHandler = {
         if !connected { print("  CONNECTION: INVALIDATED (connection rejected)") }
         else { print("  CONNECTION: invalidated after use") }
-        connSema.signal()
     }
     conn.interruptionHandler = {
         print("  CONNECTION: INTERRUPTED (entitlement check at connection level)")
-        connSema.signal()
     }
     conn.resume()
 
-    let proxyAny = conn.remoteObjectProxyWithErrorHandler { err in
+    let proxy = conn.remoteObjectProxyWithErrorHandler { err in
         print("  PROXY ERROR: \(err.localizedDescription)")
-        connSema.signal()
-    }
-
-    guard let proxy = proxyAny as? T else {
-        print("  Proxy cast failed")
-        conn.invalidate()
-        return
-    }
+    } as AnyObject
 
     connected = true
     print("  Proxy obtained — testing \(actions.count) methods")
@@ -200,15 +192,15 @@ deepProbe(
     service: "com.apple.OSIntelligence.battery",
     proto: OSIntelligenceBatteryXPC.self,
     actions: [
-        ("ping", { p, s in p.ping? { _, _ in print("    PING REPLY"); s.signal() } }),
-        ("getStatus", { p, s in p.getStatus? { r, _ in print("    STATUS: \(r?.count ?? 0) keys"); s.signal() } }),
-        ("getCapabilities", { p, s in p.getCapabilities? { r, _ in print("    CAPS: \(r?.count ?? 0) keys"); s.signal() } }),
-        ("getCurrentBatteryState", { p, s in p.getCurrentBatteryState? { r, _ in print("    BATTERY: \(String(describing: r))"); s.signal() } }),
-        ("requestBatteryInfo", { p, s in p.requestBatteryInfo? { r, _ in print("    INFO: \(String(describing: r))"); s.signal() } }),
-        ("getBatteryStats", { p, s in p.getBatteryStats? { r, _ in print("    STATS: \(r?.count ?? 0) keys"); s.signal() } }),
-        ("getPrediction", { p, s in p.getPrediction?(["source": "probe"] as NSDictionary) { r, _ in print("    PRED: \(String(describing: r))"); s.signal() } }),
-        ("getUsageStats", { p, s in p.getUsageStats? { r, _ in print("    USAGE: \(r?.count ?? 0) keys"); s.signal() } }),
-        ("sendRequest", { p, s in p.sendRequest?(["type": "battery_query"] as NSDictionary) { r, _ in print("    REQ: \(String(describing: r))"); s.signal() } }),
+        ("ping", { p, s in (p as? OSIntelligenceBatteryXPC)?.ping? { _, _ in print("    PING REPLY"); s.signal() } }),
+        ("getStatus", { p, s in (p as? OSIntelligenceBatteryXPC)?.getStatus? { r, _ in print("    STATUS: \(r?.count ?? 0) keys"); s.signal() } }),
+        ("getCapabilities", { p, s in (p as? OSIntelligenceBatteryXPC)?.getCapabilities? { r, _ in print("    CAPS: \(r?.count ?? 0) keys"); s.signal() } }),
+        ("getCurrentBatteryState", { p, s in (p as? OSIntelligenceBatteryXPC)?.getCurrentBatteryState? { r, _ in print("    BATTERY: \(String(describing: r))"); s.signal() } }),
+        ("requestBatteryInfo", { p, s in (p as? OSIntelligenceBatteryXPC)?.requestBatteryInfo? { r, _ in print("    INFO: \(String(describing: r))"); s.signal() } }),
+        ("getBatteryStats", { p, s in (p as? OSIntelligenceBatteryXPC)?.getBatteryStats? { r, _ in print("    STATS: \(r?.count ?? 0) keys"); s.signal() } }),
+        ("getPrediction", { p, s in (p as? OSIntelligenceBatteryXPC)?.getPrediction?(["source": "probe"] as NSDictionary) { r, _ in print("    PRED: \(String(describing: r))"); s.signal() } }),
+        ("getUsageStats", { p, s in (p as? OSIntelligenceBatteryXPC)?.getUsageStats? { r, _ in print("    USAGE: \(r?.count ?? 0) keys"); s.signal() } }),
+        ("sendRequest", { p, s in (p as? OSIntelligenceBatteryXPC)?.sendRequest?(["type": "battery_query"] as NSDictionary) { r, _ in print("    REQ: \(String(describing: r))"); s.signal() } }),
     ]
 )
 
@@ -217,15 +209,15 @@ deepProbe(
     service: "com.apple.OSIntelligence.charging",
     proto: OSIntelligenceChargingXPC.self,
     actions: [
-        ("ping", { p, s in p.ping? { _, _ in print("    PING REPLY"); s.signal() } }),
-        ("getStatus", { p, s in p.getStatus? { r, _ in print("    STATUS: \(r?.count ?? 0) keys"); s.signal() } }),
-        ("getCapabilities", { p, s in p.getCapabilities? { r, _ in print("    CAPS: \(r?.count ?? 0) keys"); s.signal() } }),
-        ("getOptimizedChargingState", { p, s in p.getOptimizedChargingState? { r, _ in print("    CHARGING: \(String(describing: r))"); s.signal() } }),
-        ("getChargingStats", { p, s in p.getChargingStats? { r, _ in print("    STATS: \(r?.count ?? 0) keys"); s.signal() } }),
-        ("getChargingPrediction", { p, s in p.getChargingPrediction?(["source": "probe"] as NSDictionary) { r, _ in print("    PRED: \(String(describing: r))"); s.signal() } }),
-        ("getOptimizedChargingSchedule", { p, s in p.getOptimizedChargingSchedule? { r, _ in print("    SCHEDULE: \(String(describing: r))"); s.signal() } }),
-        ("getPrediction", { p, s in p.getPrediction?(["source": "probe"] as NSDictionary) { r, _ in print("    PRED2: \(String(describing: r))"); s.signal() } }),
-        ("sendRequest", { p, s in p.recordChargingEvent?(["type": "query"] as NSDictionary) { r, _ in print("    EVENT: \(r)"); s.signal() } }),
+        ("ping", { p, s in (p as? OSIntelligenceChargingXPC)?.ping? { _, _ in print("    PING REPLY"); s.signal() } }),
+        ("getStatus", { p, s in (p as? OSIntelligenceChargingXPC)?.getStatus? { r, _ in print("    STATUS: \(r?.count ?? 0) keys"); s.signal() } }),
+        ("getCapabilities", { p, s in (p as? OSIntelligenceChargingXPC)?.getCapabilities? { r, _ in print("    CAPS: \(r?.count ?? 0) keys"); s.signal() } }),
+        ("getOptimizedChargingState", { p, s in (p as? OSIntelligenceChargingXPC)?.getOptimizedChargingState? { r, _ in print("    CHARGING: \(String(describing: r))"); s.signal() } }),
+        ("getChargingStats", { p, s in (p as? OSIntelligenceChargingXPC)?.getChargingStats? { r, _ in print("    STATS: \(r?.count ?? 0) keys"); s.signal() } }),
+        ("getChargingPrediction", { p, s in (p as? OSIntelligenceChargingXPC)?.getChargingPrediction?(["source": "probe"] as NSDictionary) { r, _ in print("    PRED: \(String(describing: r))"); s.signal() } }),
+        ("getOptimizedChargingSchedule", { p, s in (p as? OSIntelligenceChargingXPC)?.getOptimizedChargingSchedule? { r, _ in print("    SCHEDULE: \(String(describing: r))"); s.signal() } }),
+        ("getPrediction", { p, s in (p as? OSIntelligenceChargingXPC)?.getPrediction?(["source": "probe"] as NSDictionary) { r, _ in print("    PRED2: \(String(describing: r))"); s.signal() } }),
+        ("recordChargingEvent", { p, s in (p as? OSIntelligenceChargingXPC)?.recordChargingEvent?(["type": "query"] as NSDictionary) { r, _ in print("    EVENT: \(r)"); s.signal() } }),
     ]
 )
 
@@ -234,15 +226,15 @@ deepProbe(
     service: "com.apple.suggestd.mail-intelligence",
     proto: SuggestdMailIntelligenceXPC.self,
     actions: [
-        ("ping", { p, s in p.ping? { _, _ in print("    PING REPLY"); s.signal() } }),
-        ("getStatus", { p, s in p.getStatus? { r, _ in print("    STATUS: \(r?.count ?? 0) keys"); s.signal() } }),
-        ("getCapabilities", { p, s in p.getCapabilities? { r, _ in print("    CAPS: \(r?.count ?? 0) keys"); s.signal() } }),
-        ("getSmartReplies", { p, s in p.getSmartReplies?("Test email content" as NSString) { r, _ in print("    SMART REPLIES: \(r?.count ?? 0) items"); s.signal() } }),
-        ("getEmailSuggestions", { p, s in p.getEmailSuggestions?(["emailId": "test123"] as NSDictionary) { r, _ in print("    SUGGESTIONS: \(r?.count ?? 0)"); s.signal() } }),
-        ("summarizeEmail", { p, s in p.summarizeEmail?("Hello, please review the attached..." as NSString) { r, _ in print("    SUMMARY: \(String(describing: r))"); s.signal() } }),
-        ("analyzeEmail", { p, s in p.analyzeEmail?(["subject": "Test", "body": "Test content"] as NSDictionary) { r, _ in print("    ANALYSIS: \(r?.count ?? 0) keys"); s.signal() } }),
-        ("getPersonalizationData", { p, s in p.getPersonalizationData?(["type": "mail"] as NSDictionary) { r, _ in print("    PERSONAL DATA: \(r?.count ?? 0) keys — HIGH VALUE"); s.signal() } }),
-        ("submitRequest", { p, s in p.submitRequest?(["type": "mail_analyze", "content": "test"] as NSDictionary) { r, _ in print("    REQ: \(String(describing: r))"); s.signal() } }),
+        ("ping", { p, s in (p as? SuggestdMailIntelligenceXPC)?.ping? { _, _ in print("    PING REPLY"); s.signal() } }),
+        ("getStatus", { p, s in (p as? SuggestdMailIntelligenceXPC)?.getStatus? { r, _ in print("    STATUS: \(r?.count ?? 0) keys"); s.signal() } }),
+        ("getCapabilities", { p, s in (p as? SuggestdMailIntelligenceXPC)?.getCapabilities? { r, _ in print("    CAPS: \(r?.count ?? 0) keys"); s.signal() } }),
+        ("getSmartReplies", { p, s in (p as? SuggestdMailIntelligenceXPC)?.getSmartReplies?("Test email content" as NSString) { r, _ in print("    SMART REPLIES: \(r?.count ?? 0) items"); s.signal() } }),
+        ("getEmailSuggestions", { p, s in (p as? SuggestdMailIntelligenceXPC)?.getEmailSuggestions?(["emailId": "test123"] as NSDictionary) { r, _ in print("    SUGGESTIONS: \(r?.count ?? 0)"); s.signal() } }),
+        ("summarizeEmail", { p, s in (p as? SuggestdMailIntelligenceXPC)?.summarizeEmail?("Hello, please review..." as NSString) { r, _ in print("    SUMMARY: \(String(describing: r))"); s.signal() } }),
+        ("analyzeEmail", { p, s in (p as? SuggestdMailIntelligenceXPC)?.analyzeEmail?(["subject": "Test", "body": "Test"] as NSDictionary) { r, _ in print("    ANALYSIS: \(r?.count ?? 0) keys"); s.signal() } }),
+        ("getPersonalizationData", { p, s in (p as? SuggestdMailIntelligenceXPC)?.getPersonalizationData?(["type": "mail"] as NSDictionary) { r, _ in print("    PERSONAL DATA: \(r?.count ?? 0) keys"); s.signal() } }),
+        ("submitRequest", { p, s in (p as? SuggestdMailIntelligenceXPC)?.submitRequest?(["type": "mail_analyze"] as NSDictionary) { r, _ in print("    REQ: \(String(describing: r))"); s.signal() } }),
     ]
 )
 
@@ -251,15 +243,15 @@ deepProbe(
     service: "com.apple.intelligenceflow.contextIntelligence",
     proto: ContextIntelligenceXPC.self,
     actions: [
-        ("ping", { p, s in p.ping? { _, _ in print("    PING REPLY"); s.signal() } }),
-        ("getStatus", { p, s in p.getStatus? { r, _ in print("    STATUS: \(r?.count ?? 0) keys"); s.signal() } }),
-        ("getCapabilities", { p, s in p.getCapabilities? { r, _ in print("    CAPS: \(r?.count ?? 0) keys"); s.signal() } }),
-        ("getContextualIntelligence", { p, s in p.getContextualIntelligence?(["query": "test"] as NSDictionary) { r, _ in print("    CONTEXT INTEL: \(r?.count ?? 0) keys — HIGH VALUE"); s.signal() } }),
-        ("getPersonalContext", { p, s in p.getPersonalContext?("upcoming meetings" as NSString) { r, _ in print("    PERSONAL: \(r?.count ?? 0) keys — HIGH VALUE"); s.signal() } }),
-        ("getContextSummary", { p, s in p.getContextSummary? { r, _ in print("    SUMMARY: \(r?.count ?? 0) keys"); s.signal() } }),
-        ("getContextForQuery", { p, s in p.getContextForQuery?("What are my tasks today?" as NSString) { r, _ in print("    QUERY CTX: \(r?.count ?? 0) keys"); s.signal() } }),
-        ("getRecentActivity", { p, s in p.getRecentActivity?(10) { r, _ in print("    RECENT: \(r?.count ?? 0) items — HIGH VALUE"); s.signal() } }),
-        ("getSignals", { p, s in p.getSignals?(["type": "all"] as NSDictionary) { r, _ in print("    SIGNALS: \(r?.count ?? 0) keys"); s.signal() } }),
+        ("ping", { p, s in (p as? ContextIntelligenceXPC)?.ping? { _, _ in print("    PING REPLY"); s.signal() } }),
+        ("getStatus", { p, s in (p as? ContextIntelligenceXPC)?.getStatus? { r, _ in print("    STATUS: \(r?.count ?? 0) keys"); s.signal() } }),
+        ("getCapabilities", { p, s in (p as? ContextIntelligenceXPC)?.getCapabilities? { r, _ in print("    CAPS: \(r?.count ?? 0) keys"); s.signal() } }),
+        ("getContextualIntelligence", { p, s in (p as? ContextIntelligenceXPC)?.getContextualIntelligence?(["query": "test"] as NSDictionary) { r, _ in print("    CONTEXT INTEL: \(r?.count ?? 0) keys"); s.signal() } }),
+        ("getPersonalContext", { p, s in (p as? ContextIntelligenceXPC)?.getPersonalContext?("upcoming meetings" as NSString) { r, _ in print("    PERSONAL: \(r?.count ?? 0) keys"); s.signal() } }),
+        ("getContextSummary", { p, s in (p as? ContextIntelligenceXPC)?.getContextSummary? { r, _ in print("    SUMMARY: \(r?.count ?? 0) keys"); s.signal() } }),
+        ("getContextForQuery", { p, s in (p as? ContextIntelligenceXPC)?.getContextForQuery?("What are my tasks today?" as NSString) { r, _ in print("    QUERY CTX: \(r?.count ?? 0) keys"); s.signal() } }),
+        ("getRecentActivity", { p, s in (p as? ContextIntelligenceXPC)?.getRecentActivity?(10) { r, _ in print("    RECENT: \(r?.count ?? 0) items"); s.signal() } }),
+        ("getSignals", { p, s in (p as? ContextIntelligenceXPC)?.getSignals?(["type": "all"] as NSDictionary) { r, _ in print("    SIGNALS: \(r?.count ?? 0) keys"); s.signal() } }),
     ]
 )
 
