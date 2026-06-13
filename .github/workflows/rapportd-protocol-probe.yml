@@ -10,46 +10,88 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: ObjC protocol extraction from rapportd
-        run: python3 rapportd_objc_proto_extract.py 2>&1
-
-      - name: nm symbol table - protocols and XPC services
+      - name: Find RPRemoteDisplayDevice framework
         run: |
-          echo "=== nm: Protocol/PROTOCOL symbols ==="
-          nm -g /usr/libexec/rapportd 2>/dev/null | grep -iE "(Protocol|PROTOCOL|NSXPCInterface|RemoteDisplay|rapport)" | head -50
+          echo "=== Where is RPRemoteDisplayDevice defined? ==="
+          # nm on rapportd shows it as undefined (U), so it comes from a framework
+          nm -g /usr/libexec/rapportd 2>/dev/null | grep "RPRemoteDisplay" | head -10
 
           echo ""
-          echo "=== otool: ObjC class metadata (protocols only) ==="
-          otool -ov /usr/libexec/rapportd 2>/dev/null | \
-            awk '/Protocols:|protocol_t|instanceMethods|classMethods/{found=1} found{print; count++; if(count>300){exit}}' | head -200
-
-          echo ""
-          echo "=== otool: All ObjC class names ==="
-          otool -ov /usr/libexec/rapportd 2>/dev/null | grep -E "^  name " | head -60
-
-      - name: Search RemoteDisplay framework and companion daemons
-        run: |
-          echo "=== Private frameworks with 'Display' or 'Mirror' or 'Phone' ==="
-          ls /System/Library/PrivateFrameworks/ 2>/dev/null | \
-            grep -iE "(display|mirror|phone|rapport|continu|screen|iphone|capture)" | head -30
-
-          echo ""
-          echo "=== mirrord / mirroringd / phonelinkd locations ==="
-          for name in mirrord mirroringd phonelinkd continuousCapture screensharingd; do
-            f=$(which $name 2>/dev/null || find /usr/libexec /System/Library/CoreServices /System/Library/PrivateFrameworks -name "$name" 2>/dev/null | head -1)
-            if [ -n "$f" ]; then
-              echo "FOUND: $f"
-              strings "$f" 2>/dev/null | grep -E "(RemoteDisplay|rapport|Protocol|NSXPCInterface)" | head -10
-            else
-              echo "NOT FOUND: $name"
+          echo "=== Searching PrivateFrameworks for RPRemoteDisplayDevice ==="
+          # Search only dylib/framework binaries
+          for f in /System/Library/PrivateFrameworks/*.framework; do
+            fw_name=$(basename "$f" .framework)
+            binary="$f/$fw_name"
+            if [ -f "$binary" ]; then
+              if nm -g "$binary" 2>/dev/null | grep -q "RPRemoteDisplayDevice"; then
+                echo "FOUND in: $binary"
+                nm -g "$binary" 2>/dev/null | grep -E "(RPRemoteDisplay|NSXPCInterface)" | head -20
+              fi
             fi
           done
 
           echo ""
-          echo "=== Look for 'RemoteDisplay' in all PrivateFrameworks binaries ==="
-          find /System/Library/PrivateFrameworks -type f -name "*.framework" 2>/dev/null | head -5
-          grep -rl "com.apple.RemoteDisplay" /System/Library/PrivateFrameworks/ 2>/dev/null | head -20 || true
-          grep -rl "RemoteDisplayServer" /System/Library/ 2>/dev/null | head -10 || true
+          echo "=== Also check /usr/lib/ ==="
+          for f in /usr/lib/*.dylib; do
+            if nm -g "$f" 2>/dev/null | grep -q "RPRemoteDisplayDevice" 2>/dev/null; then
+              echo "FOUND: $f"
+            fi
+          done
+
+      - name: rapportd string analysis
+        run: python3 rapportd_proto_strings.py 2>&1
+
+      - name: nm deep dive - all protocol symbols across rapportd + imports
+        run: |
+          RAPPORT="/usr/libexec/rapportd"
+
+          echo "=== All DEFINED ObjC protocols (nm OBJC_PROTOCOL_$) ==="
+          nm -g "$RAPPORT" 2>/dev/null | grep "OBJC_PROTOCOL" | head -30 || echo "(none defined)"
+
+          echo ""
+          echo "=== All ObjC class names (DEFINED in rapportd) ==="
+          nm -g "$RAPPORT" 2>/dev/null | grep "T _OBJC_CLASS" | awk '{print $3}' | sed 's/_OBJC_CLASS_\$_//' | sort | head -50
+
+          echo ""
+          echo "=== Undefined (imported) ObjC classes ==="
+          nm -g "$RAPPORT" 2>/dev/null | grep "U _OBJC_CLASS" | awk '{print $2}' | sed 's/_OBJC_CLASS_\$_//' | sort | head -40
+
+          echo ""
+          echo "=== ObjC class names starting with RP ==="
+          nm -g "$RAPPORT" 2>/dev/null | grep "OBJC_CLASS.*_RP" | head -40
+
+          echo ""
+          echo "=== All defined ObjC selectors containing 'Display' or 'Mirror' or 'Wombat' ==="
+          strings "$RAPPORT" 2>/dev/null | grep -iE "^(display|mirror|wombat|session|startRemote|stopRemote)" | sort -u | head -30
+
+          echo ""
+          echo "=== String literals: all 'com.apple.' entries ==="
+          strings "$RAPPORT" 2>/dev/null | grep "^com\.apple\." | sort -u | head -80
+
+      - name: Search for RemoteDisplay framework binary
+        run: |
+          echo "=== PrivateFrameworks with Display/Mirror/Rapport/Phone in name ==="
+          ls /System/Library/PrivateFrameworks/ | grep -iE "(display|mirror|rapport|phone|screen|capture|continu|iphone)" | head -30
+
+          echo ""
+          echo "=== Check Rapport.framework ==="
+          ls -la /System/Library/PrivateFrameworks/Rapport.framework/ 2>/dev/null || echo "NOT FOUND"
+          if [ -f "/System/Library/PrivateFrameworks/Rapport.framework/Rapport" ]; then
+            echo "--- Rapport symbols ---"
+            nm -g /System/Library/PrivateFrameworks/Rapport.framework/Rapport 2>/dev/null | grep -iE "(RemoteDisplay|NSXPCInterface|Protocol)" | head -20
+            echo "--- Rapport strings ---"
+            strings /System/Library/PrivateFrameworks/Rapport.framework/Rapport 2>/dev/null | grep -iE "(RemoteDisplay|Protocol|NSXPCInterface|entitlement)" | head -20
+          fi
+
+          echo ""
+          echo "=== Check CoreTelephony.framework (has rapport-related XPC) ==="
+          if [ -d "/System/Library/Frameworks/CoreTelephony.framework" ]; then
+            nm -g /System/Library/Frameworks/CoreTelephony.framework/CoreTelephony 2>/dev/null | grep -iE "(RPRemote|rapport)" | head -10
+          fi
+
+          echo ""
+          echo "=== launchctl services related to rapport/remote ==="
+          launchctl list 2>/dev/null | grep -iE "(rapport|remote|display|mirror|phone|wifip2)" | head -20 || true
 
       - name: Compile and run NSXPCProxy protocol probe
         run: |
@@ -62,75 +104,72 @@ jobs:
           echo "=== Running probe ==="
           ./rapportd_nsxpc_proto_probe 2>&1 || true
 
-      - name: Check rapportd logs after NSXPCProxy probe
+      - name: Check rapportd logs after probe
         run: |
-          echo "=== rapportd logs (last 20s) ==="
-          log show --predicate 'process == "rapportd"' --last 20s 2>/dev/null | \
-            grep -vE "(WiFiManagerClient|Logging)" | head -60 || true
+          echo "=== rapportd logs (last 30s) ==="
+          log show --predicate 'process == "rapportd"' --last 30s 2>/dev/null | \
+            grep -vE "(WiFiManagerClient|Logging)" | head -80 || true
 
-      - name: Probe com.apple.rapport.people and .matching services
+      - name: Entitlement check probing - SecTaskCopyValueForEntitlement
         run: |
-          echo "=== Testing rapport.people and rapport.matching via NSXPCConnection ==="
+          echo "=== Does rapportd use SecTask for connection entitlement checks? ==="
+          strings /usr/libexec/rapportd 2>/dev/null | \
+            grep -iE "(SecTask|SecCode|auditToken|entitlement|peer.*credential|connection.*credential)" | sort -u | head -20
+
+          echo ""
+          echo "=== Does rapportd check for specific entitlement keys? ==="
+          strings /usr/libexec/rapportd 2>/dev/null | \
+            grep -E "com\.apple\.(.*entitlement|developer\.|permission)" | sort -u | head -20
+
+          echo ""
+          echo "=== All 'com.apple.rapport' and 'com.apple.RemoteDisplay' entitlement strings ==="
+          strings /usr/libexec/rapportd 2>/dev/null | \
+            grep -iE "(com\.apple\.rapport|com\.apple\.RemoteDisplay)" | sort -u | head -30
+
+          echo ""
+          echo "=== NSXPCListener newConnectionHandler setup strings ==="
+          strings /usr/libexec/rapportd 2>/dev/null | \
+            grep -iE "(newConnection|listenerEndpoint|serviceListener|acceptConnection)" | head -10
+
+      - name: Probe rapport.people and rapport.matching services
+        run: |
           cat > /tmp/probe_extra.swift << 'SWIFT_EOF'
-          import Foundation
+import Foundation
 
-          let extras = [
-              "com.apple.rapport.people",
-              "com.apple.rapport.matching",
-              "com.apple.rapport.private-discovery",
-          ]
+let extras = [
+    "com.apple.rapport.people",
+    "com.apple.rapport.matching",
+    "com.apple.rapport.private-discovery",
+    "com.apple.rapport",
+    "com.apple.RemoteDisplay",
+]
 
-          for name in extras {
-              print("Service: \(name)")
-              let conn = NSXPCConnection(machServiceName: name, options: NSXPCConnection.Options(rawValue: 0))
-              var status = "TIMEOUT (open)"
-              let sema = DispatchSemaphore(value: 0)
-              conn.invalidationHandler = { status = "INVALIDATED"; sema.signal() }
-              conn.interruptionHandler = { status = "INTERRUPTED"; sema.signal() }
-              conn.resume()
-              if sema.wait(timeout: .now() + .seconds(3)) == .timedOut {
-                  status = "TIMEOUT (stayed open 3s) = ACCESSIBLE"
-              }
-              conn.invalidate()
-              print("  -> \(status)")
-          }
-          SWIFT_EOF
+for name in extras {
+    print("Service: \(name)")
+    let conn = NSXPCConnection(machServiceName: name, options: NSXPCConnection.Options(rawValue: 0))
+    var status = "TIMEOUT (stayed open = ACCESSIBLE)"
+    let sema = DispatchSemaphore(value: 0)
+    conn.invalidationHandler = { status = "INVALIDATED (rejected)"; sema.signal() }
+    conn.interruptionHandler = { status = "INTERRUPTED (service broke connection)"; sema.signal() }
+    conn.resume()
+    if sema.wait(timeout: .now() + .seconds(4)) == .timedOut {
+        status = "TIMEOUT (4s) = NO ENTITLEMENT CHECK AT CONNECT"
+    }
+    conn.invalidate()
+    print("  -> \(status)\n")
+}
+SWIFT_EOF
           swiftc /tmp/probe_extra.swift -o /tmp/probe_extra 2>&1
           /tmp/probe_extra 2>&1 || true
 
-      - name: Deep binary analysis - rapportd listener setup and protocol assignment
+      - name: Deep analysis - list all ObjC classes in rapportd
         run: |
-          RAPPORT="/usr/libexec/rapportd"
-
-          echo "=== All com.apple.* service strings ==="
-          strings "$RAPPORT" 2>/dev/null | grep "^com\.apple\." | sort -u | head -60
-
-          echo ""
-          echo "=== XPC listener / server strings ==="
-          strings "$RAPPORT" 2>/dev/null | \
-            grep -iE "(NSXPCListener|machServiceName|listenerWithMachServiceName|serviceWithName|registerService)" | head -20
+          echo "=== All ObjC class names defined IN rapportd (otool classlist) ==="
+          otool -ov /usr/libexec/rapportd 2>/dev/null | \
+            grep "^\s*name\s\+0x" | grep -v "__mh_execute_header" | \
+            awk '{print $NF}' | sort -u | head -100
 
           echo ""
-          echo "=== NSXPCInterface + setExported + remoteObject strings ==="
-          strings "$RAPPORT" 2>/dev/null | \
-            grep -iE "(setExported|exportedInterface|remoteObjectInterface|interfaceWithProtocol|allowedClasses)" | head -20
-
-          echo ""
-          echo "=== Connection handler strings (what rapportd does on new connection) ==="
-          strings "$RAPPORT" 2>/dev/null | \
-            grep -iE "(newConnection|connection.*accepted|listener.*connection|connection.*handler)" | head -20
-
-          echo ""
-          echo "=== Error message strings near entitlement checks ==="
-          strings "$RAPPORT" 2>/dev/null | \
-            grep -iE "(entitlement|authorization|permission|privileged|unauthorized|denied|forbidden)" | head -20
-
-          echo ""
-          echo "=== audit token / task port / pid / uid strings (process verification) ==="
-          strings "$RAPPORT" 2>/dev/null | \
-            grep -iE "(auditToken|taskPort|SecCode|SecTask|getpid|getuid|peer.*pid|connection.*pid)" | head -20
-
-          echo ""
-          echo "=== Mach send rights / port names for com.apple.RemoteDisplay ==="
-          strings "$RAPPORT" 2>/dev/null | \
-            grep -E "(RemoteDisplay|remoteDisplay)" | sort -u | head -30
+          echo "=== ObjC protocol list section (protolist) ==="
+          otool -s __DATA_CONST __objc_protolist /usr/libexec/rapportd 2>/dev/null | head -30
+          otool -s __DATA __objc_protolist /usr/libexec/rapportd 2>/dev/null | head -30
