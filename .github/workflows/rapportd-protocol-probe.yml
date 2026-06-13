@@ -93,11 +93,31 @@ jobs:
           echo "=== launchctl services related to rapport/remote ==="
           launchctl list 2>/dev/null | grep -iE "(rapport|remote|display|mirror|phone|wifip2)" | head -20 || true
 
+      - name: Search ScreenContinuityServices and Rapport framework for protocols
+        run: |
+          for fw in ScreenContinuityServices Rapport RapportUI CMContinuityCaptureCore; do
+            binary="/System/Library/PrivateFrameworks/${fw}.framework/${fw}"
+            if [ -f "$binary" ]; then
+              echo "=== $fw ==="
+              echo "--- nm: RPRemoteDisplay/Protocol symbols ---"
+              nm -g "$binary" 2>/dev/null | grep -iE "(RPRemoteDisplay|OBJC_PROTOCOL|NSXPCInterface|Continuity)" | head -20
+              echo "--- strings: protocol/interface keywords ---"
+              strings "$binary" 2>/dev/null | grep -iE "(RemoteDisplay|Protocol|NSXPCInterface|entitlement|diagnosticCommand|Dedicated|SessionState)" | head -20
+            else
+              echo "No binary at $binary"
+            fi
+          done
+
+          echo ""
+          echo "=== Also probe via dyld_shared_cache_util if available ==="
+          which dyld_shared_cache_util 2>/dev/null || echo "dyld_shared_cache_util not found"
+          ls /System/Volumes/Preboot/Cryptexes/OS/usr/lib/dyld_shared_cache* 2>/dev/null | head -5 || echo "(not accessible)"
+
       - name: Compile and run NSXPCProxy protocol probe
         run: |
           echo "=== Compiling NSXPCProxy protocol probe ==="
           clang -o rapportd_nsxpc_proto_probe rapportd_nsxpc_proto_probe.m \
-            -framework Foundation 2>&1
+            -framework Foundation 2>&1 || true
           echo "Compile exit: $?"
 
           echo ""
@@ -105,6 +125,7 @@ jobs:
           ./rapportd_nsxpc_proto_probe 2>&1 || true
 
       - name: Check rapportd logs after probe
+        continue-on-error: true
         run: |
           echo "=== rapportd logs (last 30s) ==="
           log show --predicate 'process == "rapportd"' --last 30s 2>/dev/null | \
