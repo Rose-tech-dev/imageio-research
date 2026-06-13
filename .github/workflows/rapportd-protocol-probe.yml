@@ -168,6 +168,29 @@ jobs:
             grep -vE "^\s+[0-9]+\s+(CoreFoundation|libobjc|Foundation|libxpc|libdispatch|libsystem)" | \
             head -250 || true
 
+      - name: Non-nil class whitelist probe + log capture
+        continue-on-error: true
+        run: |
+          PROBE_START=$(date -u "+%Y-%m-%d %H:%M:%S")
+          echo "=== Non-nil probe start: $PROBE_START ==="
+
+          echo "=== Compiling non-nil / class-spoof probe ==="
+          swiftc rapportd_nonnull_probe.swift -o /tmp/rd_nonnull 2>&1
+          echo "Compile exit: $?"
+
+          echo ""
+          echo "=== Running non-nil probe (NSObject / NSNull / NSString / fake RPRemoteDisplayDevice) ==="
+          /tmp/rd_nonnull 2>&1 || true
+
+          echo ""
+          echo "=== rapportd logs from non-nil probe window ==="
+          log show \
+            --predicate 'process == "rapportd"' \
+            --start "$PROBE_START" \
+            2>/dev/null | \
+            grep -vE "^\s+[0-9]+\s+(CoreFoundation|libobjc|Foundation|libxpc|libdispatch|libsystem)" | \
+            head -300 || true
+
       - name: Entitlement check probing - SecTaskCopyValueForEntitlement
         run: |
           echo "=== Does rapportd use SecTask for connection entitlement checks? ==="
