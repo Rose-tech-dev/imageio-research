@@ -1,0 +1,51 @@
+name: Final PoC - OSIntelligence XPC Bypass
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'poc_osint_bypass.swift'
+      - '.github/workflows/final-poc-run.yml'
+
+jobs:
+  poc:
+    runs-on: macos-15
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: System info
+        run: |
+          sw_vers
+          echo "UID: $(id -u)  USER: $(whoami)"
+          echo "SIP: $(csrutil status)"
+          echo "Entitlements on this process (should be none):"
+          codesign -d --entitlements - /bin/sh 2>/dev/null || echo "(none)"
+
+      - name: Compile PoC
+        run: |
+          swiftc poc_osint_bypass.swift -o /tmp/poc_osint_bypass 2>&1
+          echo "Exit: $?"
+
+      - name: Run PoC
+        timeout-minutes: 5
+        run: |
+          /tmp/poc_osint_bypass 2>&1
+
+      - name: Collect evidence logs
+        run: |
+          echo "=== Rejection logs for control cases (confirms entitlement IS enforced elsewhere) ==="
+          log show \
+            --predicate 'message CONTAINS "Rejecting connection" AND (message CONTAINS "OSIntelligence" OR message CONTAINS "intelligenceflow" OR message CONTAINS "suggestd")' \
+            --last 5m --info --debug 2>/dev/null | grep -v "^Timestamp" | head -30 \
+            || echo "(none)"
+
+          echo ""
+          echo "=== ospredictiond connection logs (no rejection = bypass confirmed) ==="
+          log show \
+            --predicate 'process == "ospredictiond"' \
+            --last 5m --info 2>/dev/null | grep -v "^Timestamp" | head -30 \
+            || echo "(no ospredictiond logs)"
+        continue-on-error: true
