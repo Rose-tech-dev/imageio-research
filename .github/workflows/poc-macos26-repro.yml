@@ -36,6 +36,14 @@ jobs:
           /tmp/gen5_probe 2>&1
         continue-on-error: true
 
+      - name: Gen6 - Scalar reply types + real Protocol* lookup
+        timeout-minutes: 10
+        run: |
+          echo "=== Gen6: Scalar reply types + OSIntelligence.framework dlopen ==="
+          swiftc osint_gen6_real_proto.swift -o /tmp/gen6_probe 2>&1
+          /tmp/gen6_probe 2>&1
+        continue-on-error: true
+
       - name: Collect rejection logs
         run: |
           echo "=== Rejection logs (control cases) ==="
