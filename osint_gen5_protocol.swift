@@ -22,7 +22,6 @@ import Foundation
 // until we extract them from the binary below.
 
 @objc protocol OSIntelligenceBatteryXPC: NSObjectProtocol {
-    // Primary candidates
     @objc optional func currentBatteryLevelWithContext(
         _ context: NSDictionary?,
         reply: ((NSNumber?, NSError?) -> Void)?)
@@ -32,15 +31,6 @@ import Foundation
 
     @objc optional func recordChargingEvent(
         _ event: NSDictionary?,
-        withReply reply: ((Bool, NSError?) -> Void)?)
-
-    // Variant signatures (in case types differ from guess)
-    @objc optional func currentBatteryLevelWithContext(
-        _ context: NSData?,
-        reply: ((NSNumber?, NSError?) -> Void)?)
-
-    @objc optional func recordChargingEvent(
-        _ event: NSData?,
         withReply reply: ((Bool, NSError?) -> Void)?)
 }
 
@@ -133,7 +123,7 @@ if let (battConn, battProxy) = openConnection(
     // R2: currentBatteryLevelWithContext — nil context
     print("\n[R2] currentBatteryLevelWithContext(nil)")
     let s2 = DispatchSemaphore(value: 0)
-    p?.currentBatteryLevelWithContext(nil) { result, err in
+    p?.currentBatteryLevelWithContext?(nil as NSDictionary?) { result, err in
         if let r = result { print("  REPLY: \(r)  ← data from root!") }
         else if let e = err { print("  ERROR: \(e.localizedDescription)") }
         else { print("  REPLY: nil/nil") }
@@ -144,7 +134,7 @@ if let (battConn, battProxy) = openConnection(
     // R3: currentBatteryLevelWithContext — NSDictionary context
     print("\n[R3] currentBatteryLevelWithContext(testDict)")
     let s3 = DispatchSemaphore(value: 0)
-    p?.currentBatteryLevelWithContext(testDict) { result, err in
+    p?.currentBatteryLevelWithContext?(testDict) { result, err in
         if let r = result { print("  REPLY: \(r)  ← root daemon processed dict!") }
         else if let e = err { print("  ERROR: \(e.localizedDescription)") }
         else { print("  REPLY: nil/nil") }
@@ -155,7 +145,7 @@ if let (battConn, battProxy) = openConnection(
     // R4: currentBatteryLevelWithContext — malformed/boundary dict
     print("\n[R4] currentBatteryLevelWithContext(malformedDict — boundary values)")
     let s4 = DispatchSemaphore(value: 0)
-    p?.currentBatteryLevelWithContext(malformedDict) { result, err in
+    p?.currentBatteryLevelWithContext?(malformedDict) { result, err in
         if let r = result { print("  REPLY: \(r)") }
         else if let e = err { print("  ERROR: \(e.localizedDescription)") }
         else { print("  REPLY: nil/nil") }
@@ -166,7 +156,7 @@ if let (battConn, battProxy) = openConnection(
     // R5: recordChargingEvent — nil
     print("\n[R5] recordChargingEvent(nil)")
     let s5 = DispatchSemaphore(value: 0)
-    p?.recordChargingEvent(nil) { ok, err in
+    p?.recordChargingEvent?(nil as NSDictionary?) { ok, err in
         if let e = err { print("  ERROR: \(e.localizedDescription)") }
         else { print("  REPLY: ok=\(ok)") }
         s5.signal()
@@ -176,7 +166,7 @@ if let (battConn, battProxy) = openConnection(
     // R6: recordChargingEvent — structured dict
     print("\n[R6] recordChargingEvent(testDict)")
     let s6 = DispatchSemaphore(value: 0)
-    p?.recordChargingEvent(testDict) { ok, err in
+    p?.recordChargingEvent?(testDict) { ok, err in
         if let e = err { print("  ERROR: \(e.localizedDescription)") }
         else { print("  REPLY: ok=\(ok)  ← root daemon recorded our event!") }
         s6.signal()
@@ -187,7 +177,7 @@ if let (battConn, battProxy) = openConnection(
     print("\n[R7] recordChargingEvent(NSData 65KB — overflow probe)")
     let dataDict: NSDictionary = ["payload": largeData, "type": NSNumber(value: 0xDEADBEEF)]
     let s7 = DispatchSemaphore(value: 0)
-    p?.recordChargingEvent(dataDict) { ok, err in
+    p?.recordChargingEvent?(dataDict) { ok, err in
         if let e = err { print("  ERROR: \(e.localizedDescription)") }
         else { print("  REPLY: ok=\(ok)") }
         s7.signal()
@@ -210,8 +200,8 @@ if let (chgConn, chgProxy) = openConnection(
     // C1: adjustedChargingDecision — all nil args
     print("\n[C1] adjustedChargingDecision(all nil)")
     let c1 = DispatchSemaphore(value: 0)
-    p?.adjustedChargingDecision(
-        nil, withPluginDate: nil,
+    p?.adjustedChargingDecision?(
+        nil as NSDictionary?, withPluginDate: nil,
         withPluginBatteryLevel: nil,
         forDate: nil,
         forStatus: nil) { result, err in
@@ -225,7 +215,7 @@ if let (chgConn, chgProxy) = openConnection(
     // C2: adjustedChargingDecision — typed args
     print("\n[C2] adjustedChargingDecision(typed args)")
     let c2 = DispatchSemaphore(value: 0)
-    p?.adjustedChargingDecision(
+    p?.adjustedChargingDecision?(
         testDict,
         withPluginDate: NSDate(),
         withPluginBatteryLevel: NSNumber(value: 85),
@@ -241,7 +231,7 @@ if let (chgConn, chgProxy) = openConnection(
     // C3: boundary value — Int64.max for level/status
     print("\n[C3] adjustedChargingDecision(Int64.max boundary values)")
     let c3 = DispatchSemaphore(value: 0)
-    p?.adjustedChargingDecision(
+    p?.adjustedChargingDecision?(
         malformedDict,
         withPluginDate: NSDate(timeIntervalSince1970: TimeInterval(Int64.max)),
         withPluginBatteryLevel: NSNumber(value: Int64.max),
