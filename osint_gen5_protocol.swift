@@ -32,6 +32,13 @@ import Foundation
     @objc optional func recordChargingEvent(
         _ event: NSDictionary?,
         withReply reply: ((Bool, NSError?) -> Void)?)
+
+    // New candidates from nm strings dump
+    @objc optional func batteryLifeMitigationWithHandler(
+        _ reply: ((NSNumber?, NSError?) -> Void)?)
+
+    @objc optional func inTypicalChargingLocationWithHandler(
+        _ reply: ((Bool, NSError?) -> Void)?)
 }
 
 @objc protocol OSIntelligenceChargingXPC: NSObjectProtocol {
@@ -183,6 +190,28 @@ if let (battConn, battProxy) = openConnection(
         s7.signal()
     }
     if !wait(s7, timeout: 6) { print("  TIMEOUT — accepted") }
+
+    // R8: batteryLifeMitigationWithHandler (new candidate from nm)
+    print("\n[R8] batteryLifeMitigationWithHandler")
+    let s8 = DispatchSemaphore(value: 0)
+    p?.batteryLifeMitigationWithHandler? { result, err in
+        if let r = result { print("  REPLY: \(r)  ← LIVE DATA FROM ROOT DAEMON") }
+        else if let e = err { print("  ERROR: \(e.localizedDescription)") }
+        else { print("  REPLY: nil/nil") }
+        s8.signal()
+    }
+    if !wait(s8, timeout: 6) { print("  TIMEOUT — accepted") }
+
+    // R9: inTypicalChargingLocationWithHandler (new candidate from nm)
+    print("\n[R9] inTypicalChargingLocationWithHandler")
+    let s9 = DispatchSemaphore(value: 0)
+    p?.inTypicalChargingLocationWithHandler? { result, err in
+        if result { print("  REPLY: true  ← LIVE DATA FROM ROOT DAEMON") }
+        else if let e = err { print("  ERROR: \(e.localizedDescription)") }
+        else { print("  REPLY: false") }
+        s9.signal()
+    }
+    if !wait(s9, timeout: 6) { print("  TIMEOUT — accepted") }
 
     battConn.invalidate()
     Thread.sleep(forTimeInterval: 1.0)

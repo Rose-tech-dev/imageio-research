@@ -165,7 +165,7 @@ if let protos = allProtocols {
             found += 1
         }
     }
-    free(allProtocols)
+    // AutoreleasingUnsafeMutablePointer is ARC-managed — do not call free()
 }
 
 if found == 0 {
@@ -179,7 +179,7 @@ if found == 0 {
             let name = String(cString: protocol_getName(protos[i]))
             print("  \(name)")
         }
-        free(all2)
+        // AutoreleasingUnsafeMutablePointer — do not call free()
     }
 }
 
@@ -231,10 +231,10 @@ if let classes = allClasses {
                     let types = String(cString: method_getTypeEncoding(m[j])!)
                     print("  - (?) \(selName);  // \(types)")
                 }
-                free(methods)
+                free(UnsafeMutableRawPointer(m))
             }
             print("@end")
         }
     }
-    free(allClasses)
+    // AutoreleasingUnsafeMutablePointer — do not call free()
 }
