@@ -88,3 +88,11 @@ jobs:
           echo ""
           echo "=== All strings with With/Reply/Handler pattern ==="
           strings /usr/libexec/ospredictiond 2>/dev/null | grep -E "With[A-Z]|:reply\|:withReply|Handler:|Context:|Decision:" | head -100
+
+      - name: ObjC runtime introspection (load framework, dump protocols)
+        run: |
+          echo "=== Compiling ObjC runtime introspector ==="
+          swiftc osint_protocol_introspect.swift -o /tmp/introspect 2>&1
+          echo "=== Running protocol introspector ==="
+          /tmp/introspect 2>&1
+        continue-on-error: true
