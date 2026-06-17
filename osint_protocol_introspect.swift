@@ -147,12 +147,23 @@ func dumpProtocol(_ proto: Protocol) {
 
 // ── Walk all registered protocols ────────────────────────────────────────────
 
-print("\n=== All protocols matching battery|charging|OSIntelligence|osprediction ===\n")
+print("\n=== All registered protocols (first 300 names) ===\n")
 
 var protoCount: UInt32 = 0
 let allProtocols = objc_copyProtocolList(&protoCount)
+print("Total protocols registered: \(protoCount)")
 
+// Print all names first so we can see everything
 var found = 0
+if let protos = allProtocols {
+    for i in 0..<Int(protoCount) {
+        let name = String(cString: protocol_getName(protos[i]))
+        print("  \(name)")
+    }
+}
+
+print("\n=== Full dump of matching protocols ===\n")
+
 if let protos = allProtocols {
     for i in 0..<Int(protoCount) {
         let proto = protos[i]
@@ -160,28 +171,15 @@ if let protos = allProtocols {
         let lower = name.lowercased()
         if lower.contains("battery") || lower.contains("charging") ||
            lower.contains("osintelligence") || lower.contains("osprediction") ||
-           lower.contains("inactivity") || lower.contains("prediction") {
+           lower.contains("inactivity") || lower.contains("prediction") ||
+           lower.contains("osint") || lower.contains("mitigation") ||
+           lower.contains("powerui") || lower.contains("smartcharge") {
             dumpProtocol(proto)
             found += 1
         }
     }
-    // AutoreleasingUnsafeMutablePointer is ARC-managed — do not call free()
 }
-
-if found == 0 {
-    print("(no matching protocols found)")
-    print("\n=== Dumping ALL protocols for manual inspection (first 50) ===")
-    var count2: UInt32 = 0
-    let all2 = objc_copyProtocolList(&count2)
-    if let protos = all2 {
-        let limit = min(Int(count2), 50)
-        for i in 0..<limit {
-            let name = String(cString: protocol_getName(protos[i]))
-            print("  \(name)")
-        }
-        // AutoreleasingUnsafeMutablePointer — do not call free()
-    }
-}
+print("Matching protocols found: \(found)")
 
 // ── Also try explicit protocol lookups by guessed names ───────────────────────
 
@@ -209,32 +207,5 @@ for name in candidateNames {
     }
 }
 
-// ── Also introspect OSIntelligence classes ────────────────────────────────────
-
-print("\n=== OSIntelligence classes with battery/charging methods ===")
-var classCount: UInt32 = 0
-let allClasses = objc_copyClassList(&classCount)
-if let classes = allClasses {
-    for i in 0..<Int(classCount) {
-        let cls: AnyClass = classes[i]
-        let clsName = String(cString: class_getName(cls))
-        let lower = clsName.lowercased()
-        if lower.contains("battery") || lower.contains("charging") ||
-           lower.contains("osintelligence") || lower.contains("prediction") {
-            print("\n@interface \(clsName)")
-            var methodCount: UInt32 = 0
-            let methods = class_copyMethodList(cls, &methodCount)
-            if let m = methods {
-                for j in 0..<Int(methodCount) {
-                    let sel = method_getName(m[j])
-                    let selName = NSStringFromSelector(sel)
-                    let types = String(cString: method_getTypeEncoding(m[j])!)
-                    print("  - (?) \(selName);  // \(types)")
-                }
-                free(UnsafeMutableRawPointer(m))
-            }
-            print("@end")
-        }
-    }
-    // AutoreleasingUnsafeMutablePointer — do not call free()
-}
+// Class enumeration removed — objc_copyClassList over the dyld cache is too heavy
+// and causes SIGKILL on GitHub Actions runners. Protocol enumeration above is sufficient.
