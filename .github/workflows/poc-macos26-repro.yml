@@ -44,6 +44,14 @@ jobs:
           /tmp/gen6_probe 2>&1
         continue-on-error: true
 
+      - name: Gen7 - Context intelligence + real protocol names
+        timeout-minutes: 10
+        run: |
+          echo "=== Gen7: contextIntelligence + real ObjC proto names ==="
+          swiftc osint_gen7_context.swift -o /tmp/gen7_probe 2>&1
+          /tmp/gen7_probe 2>&1
+        continue-on-error: true
+
       - name: Collect rejection logs
         run: |
           echo "=== Rejection logs (control cases) ==="
