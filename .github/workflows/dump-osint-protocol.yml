@@ -1,0 +1,90 @@
+name: Dump OSIntelligence.framework Protocol Signatures
+
+on:
+  workflow_dispatch:
+
+jobs:
+  dump:
+    runs-on: macos-26
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Locate OSIntelligence.framework
+        run: |
+          echo "=== Searching for OSIntelligence.framework ==="
+          find /System/Library -name "OSIntelligence" -type f 2>/dev/null | head -20
+          find /System/Library/PrivateFrameworks -maxdepth 3 -name "*OSIntelligence*" 2>/dev/null
+          find /usr/lib -name "*OSIntelligence*" 2>/dev/null || true
+
+      - name: Install class-dump
+        run: brew install class-dump 2>&1 | tail -5 || echo "brew install failed"
+
+      - name: class-dump OSIntelligence framework binary
+        run: |
+          FW=$(find /System/Library/PrivateFrameworks -name "OSIntelligence" -type f 2>/dev/null | head -1)
+          if [ -z "$FW" ]; then
+            FW=$(find /System/Library -name "OSIntelligence" -type f 2>/dev/null | head -1)
+          fi
+          echo "Binary: $FW"
+          if [ -n "$FW" ]; then
+            echo "=== class-dump output ==="
+            class-dump "$FW" 2>&1 | grep -A 30 -i "battery\|charging\|OSIntelligenceBattery\|OSIntelligenceCharging\|BatteryXPC\|ChargingXPC\|BatteryService\|ChargingService" | head -200
+          else
+            echo "Binary not found — checking dyld cache"
+          fi
+        continue-on-error: true
+
+      - name: otool ObjC metadata (battery + charging classes)
+        run: |
+          FW=$(find /System/Library/PrivateFrameworks -name "OSIntelligence" -type f 2>/dev/null | head -1)
+          if [ -z "$FW" ]; then
+            FW=$(find /System/Library -name "OSIntelligence" -type f 2>/dev/null | head -1)
+          fi
+          echo "Binary: $FW"
+          if [ -n "$FW" ]; then
+            echo "=== Full ObjC metadata (protocols + classes) ==="
+            otool -ov "$FW" 2>&1 | grep -A 40 -i "battery\|charging\|BatteryXPC\|ChargingXPC" | head -300
+            echo ""
+            echo "=== All method names in binary ==="
+            nm "$FW" 2>/dev/null | grep -i "battery\|charging" | head -100
+            echo ""
+            echo "=== strings grep for XPC selectors ==="
+            strings "$FW" 2>/dev/null | grep -i "battery\|charging\|WithContext\|WithHandler\|WithReply\|ChargingDecision\|WaitTime" | head -100
+          fi
+        continue-on-error: true
+
+      - name: Extract from dyld shared cache if not standalone
+        run: |
+          echo "=== dyld_shared_cache extraction ==="
+          CACHE=$(find /System/Library/dyld -name "dyld_shared_cache_arm64e" 2>/dev/null | head -1)
+          echo "Cache: $CACHE"
+          if [ -n "$CACHE" ]; then
+            dyld_shared_cache_util -list "$CACHE" 2>/dev/null | grep -i "OSIntelligence\|ospredictiond" | head -20 || true
+            # Try extraction
+            dyld_shared_cache_util -extract /tmp/dyld_extracted "$CACHE" 2>/dev/null || true
+            find /tmp/dyld_extracted -name "*OSIntelligence*" 2>/dev/null | head -10 || true
+          fi
+        continue-on-error: true
+
+      - name: class-dump ospredictiond directly
+        run: |
+          echo "=== class-dump ospredictiond ==="
+          class-dump /usr/libexec/ospredictiond 2>&1 | grep -B 2 -A 20 "battery\|charging\|Battery\|Charging\|XPC\|Protocol\|protocol" | head -400
+          echo ""
+          echo "=== All @protocol declarations in ospredictiond ==="
+          class-dump /usr/libexec/ospredictiond 2>&1 | grep -A 30 "@protocol" | head -400
+        continue-on-error: true
+
+      - name: nm full symbol dump ospredictiond
+        run: |
+          echo "=== All ObjC method selectors in ospredictiond ==="
+          nm /usr/libexec/ospredictiond 2>/dev/null | grep " t \+\[" | head -200
+          echo ""
+          echo "=== XPC-related selectors ==="
+          nm /usr/libexec/ospredictiond 2>/dev/null | grep -i "xpc\|battery\|charging\|context\|reply\|handler\|decision\|predict\|level\|wait\|record\|event" | head -100
+          echo ""
+          echo "=== All strings with With/Reply/Handler pattern ==="
+          strings /usr/libexec/ospredictiond 2>/dev/null | grep -E "With[A-Z]|:reply\|:withReply|Handler:|Context:|Decision:" | head -100
