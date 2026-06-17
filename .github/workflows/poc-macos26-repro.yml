@@ -1,0 +1,53 @@
+name: PoC - OSIntelligence XPC Bypass - macOS 26 Reproduction
+
+on:
+  workflow_dispatch:
+
+jobs:
+  poc-macos26:
+    runs-on: macos-26
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: System info
+        run: |
+          sw_vers
+          echo "UID: $(id -u)  USER: $(whoami)"
+          echo "SIP: $(csrutil status)"
+
+      - name: Compile PoC
+        run: |
+          swiftc poc_osint_bypass.swift -o /tmp/poc_osint_bypass 2>&1
+          echo "Compile exit: $?"
+
+      - name: Run PoC
+        timeout-minutes: 5
+        run: |
+          /tmp/poc_osint_bypass 2>&1
+
+      - name: Gen5 - Real protocol invocation (data return probe)
+        timeout-minutes: 10
+        run: |
+          echo "=== Gen5: Real method invocation against root daemon ==="
+          swiftc osint_gen5_protocol.swift -o /tmp/gen5_probe 2>&1
+          /tmp/gen5_probe 2>&1
+        continue-on-error: true
+
+      - name: Collect rejection logs
+        run: |
+          echo "=== Rejection logs (control cases) ==="
+          log show \
+            --predicate 'message CONTAINS "Rejecting connection" AND (message CONTAINS "OSIntelligence" OR message CONTAINS "intelligenceflow" OR message CONTAINS "suggestd")' \
+            --last 10m --info --debug 2>/dev/null | head -30 \
+            || echo "(none)"
+
+          echo ""
+          echo "=== ospredictiond logs ==="
+          log show \
+            --predicate 'process == "ospredictiond"' \
+            --last 10m --info 2>/dev/null | head -30 \
+            || echo "(no logs)"
+        continue-on-error: true
