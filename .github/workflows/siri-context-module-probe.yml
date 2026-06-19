@@ -1,0 +1,70 @@
+name: Siri conversation_context_module XPC Probe
+
+# Tests real MachService names from siriknowledged.plist:
+#   com.apple.siri.conversation_context_module
+#   com.apple.siri.reference_resolution_module
+#   com.apple.siri.inference.EntityMatcher.admin
+#
+# TIMEOUT = bypass. INTERRUPTED = correctly gated.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'siri_context_module_probe.swift'
+      - '.github/workflows/siri-context-module-probe.yml'
+
+jobs:
+  siri-context-probe:
+    runs-on: macos-15
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: System info
+        run: |
+          sw_vers
+          echo "UID: $(id -u)  USER: $(whoami)"
+
+      - name: Verify siriknowledged is running + dump MachServices
+        run: |
+          echo "=== siriknowledged process ==="
+          ps aux | grep -E "siriknowledged" | grep -v grep
+
+          echo ""
+          echo "=== siriknowledged.plist full MachServices ==="
+          PLIST=$(find /System/Library/LaunchAgents /System/Library/LaunchDaemons \
+            -name "*siriknowledged*" 2>/dev/null | head -1)
+          [ -n "$PLIST" ] && plutil -p "$PLIST" || echo "(plist not found)"
+
+          echo ""
+          echo "=== launchctl: is service registered? ==="
+          launchctl list | grep -iE "siriknowledge|conversation.context|reference.resolution|EntityMatcher" || echo "(none found)"
+        continue-on-error: true
+
+      - name: Compile probe
+        run: |
+          swiftc siri_context_module_probe.swift -o /tmp/siri_ctx_probe 2>&1
+          echo "Exit: $?"
+          ls -la /tmp/siri_ctx_probe 2>/dev/null || echo "(compile failed)"
+
+      - name: Run probe
+        timeout-minutes: 5
+        run: |
+          /tmp/siri_ctx_probe 2>&1
+
+      - name: Logs - siriknowledged connection events
+        run: |
+          echo "=== siriknowledged logs (last 5min) ==="
+          log show \
+            --predicate 'process == "siriknowledged" AND (message CONTAINS "deny" OR message CONTAINS "entitlement" OR message CONTAINS "connection" OR message CONTAINS "reject")' \
+            --last 5m --info --debug 2>/dev/null | head -60 || echo "(none)"
+
+          echo ""
+          echo "=== All siriknowledged logs ==="
+          log show \
+            --predicate 'process == "siriknowledged"' \
+            --last 5m --info 2>/dev/null | head -40 || echo "(none)"
+        continue-on-error: true
