@@ -1,0 +1,194 @@
+name: Siri XPC Entitlement Bypass Probe
+
+# Tests whether Siri-related daemons enforce entitlement checks at XPC connect time.
+# Key target: com.apple.siri.context.service (contacts, calendar, messages access).
+#
+# Methodology: TIMEOUT = daemon accepted connection without entitlement check (bypass)
+#              INTERRUPTED = daemon rejected at connect time (correctly gated)
+#              INVALIDATED = service not running or name wrong
+#
+# Also does binary recon on siriinferenced + siri.context daemon to extract
+# real MachService names and protocol method names for follow-up data probes.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'siriinferenced_probe.swift'
+      - '.github/workflows/siri-xpc-probe.yml'
+
+jobs:
+  siri-probe:
+    runs-on: macos-15
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: System info
+        run: |
+          sw_vers
+          echo "UID: $(id -u)  USER: $(whoami)"
+          echo "SIP: $(csrutil status 2>/dev/null || echo unknown)"
+
+      # ── RECON: confirm which Siri daemons are running + dump real service names ──
+      - name: Recon - Siri daemon inventory
+        run: |
+          echo "=== RUNNING SIRI DAEMONS ==="
+          ps aux | grep -E "siriinferenced|siri\.context|siriknowledged|siriactionsd|assistantd" \
+            | grep -v grep | awk '{print $1, $2, $11}'
+
+          echo ""
+          echo "=== LAUNCHCTL: siri-related services ==="
+          launchctl list | grep -iE "siri|assistant" | sort
+
+          echo ""
+          echo "=== PLISTS: siriinferenced MachServices ==="
+          find /System/Library/LaunchDaemons /System/Library/LaunchAgents \
+            -name "*siriinferenced*" -o -name "*siri.context*" -o -name "*siriknowledge*" \
+            -o -name "*siriactions*" 2>/dev/null | while read f; do
+            echo "FILE: $f"
+            plutil -p "$f" 2>/dev/null | grep -A3 "MachServices" | head -20
+            echo "---"
+          done
+
+          echo ""
+          echo "=== PLISTS: assistantd MachServices ==="
+          find /System/Library/LaunchDaemons /System/Library/LaunchAgents \
+            -name "*assistantd*" 2>/dev/null | while read f; do
+            echo "FILE: $f"
+            plutil -p "$f" 2>/dev/null | grep -A2 "MachServices\|com\.apple\.siri\|com\.apple\.assistant" | head -30
+            echo "---"
+          done
+        continue-on-error: true
+
+      # ── BINARY RECON: extract real protocol method names from siriinferenced ──
+      - name: Recon - siriinferenced binary method names
+        run: |
+          SIRIBINARY=$(find /System/Library/PrivateFrameworks/SiriInference.framework \
+            -type f -name "siriinferenced" 2>/dev/null | head -1)
+          if [ -z "$SIRIBINARY" ]; then
+            SIRIBINARY=$(which siriinferenced 2>/dev/null || true)
+          fi
+
+          echo "=== siriinferenced binary: ${SIRIBINARY:-NOT FOUND} ==="
+
+          if [ -n "$SIRIBINARY" ] && [ -f "$SIRIBINARY" ]; then
+            echo ""
+            echo "--- ObjC protocol/class names (grep for XPC/Protocol patterns) ---"
+            strings "$SIRIBINARY" 2>/dev/null \
+              | grep -iE "XPC|Protocol|Handler|reply|Request|Response|withReply|withHandler|Completion" \
+              | grep -v "^[A-Z][a-z]" | sort -u | head -80
+
+            echo ""
+            echo "--- nm: Objective-C method selectors ---"
+            nm "$SIRIBINARY" 2>/dev/null | grep " t " \
+              | grep -iE "xpc|siri|inference|request|reply|handler|model|predict" \
+              | awk '{$1=$2=""; print $0}' | sort | head -60
+          fi
+        continue-on-error: true
+
+      # ── BINARY RECON: find and probe siri.context daemon ────────────────────
+      - name: Recon - siri.context.service binary
+        run: |
+          echo "=== Looking for siri.context.service daemon binary ==="
+          find /System/Library /Library -type f \( \
+            -name "*SiriContext*" -o -name "*siri.context*" -o -name "*siricontextd*" \
+          \) 2>/dev/null | head -10
+
+          echo ""
+          echo "=== Searching all LaunchAgent/Daemon plists for siri.context ==="
+          grep -rl "siri\.context\|SiriContext" \
+            /System/Library/LaunchDaemons /System/Library/LaunchAgents 2>/dev/null | while read f; do
+            echo "FILE: $f"
+            plutil -p "$f" 2>/dev/null | head -20
+            echo "---"
+          done
+
+          echo ""
+          echo "=== Strings from AssistantServices.framework for context service names ==="
+          ASF="/System/Library/PrivateFrameworks/AssistantServices.framework"
+          if [ -d "$ASF" ]; then
+            find "$ASF" -type f -not -name "*.plist" -not -name "*.strings" 2>/dev/null \
+              | head -3 | while read bin; do
+              echo "Binary: $bin"
+              strings "$bin" 2>/dev/null \
+                | grep -E "com\.apple\.siri\." | sort -u | head -40
+            done
+          fi
+        continue-on-error: true
+
+      # ── COMPILE ──────────────────────────────────────────────────────────────
+      - name: Compile siriinferenced_probe.swift
+        run: |
+          echo "=== Compiling Siri XPC probe ==="
+          swiftc siriinferenced_probe.swift -o /tmp/siri_probe 2>&1
+          echo "Exit code: $?"
+          ls -la /tmp/siri_probe 2>/dev/null || echo "(binary not created — compile failed)"
+
+      # ── MAIN PROBE ───────────────────────────────────────────────────────────
+      - name: Run Siri XPC probe
+        timeout-minutes: 10
+        run: |
+          echo "=== Siri XPC Entitlement Bypass Probe ==="
+          echo "PID: $$  UID: $(id -u)  No special entitlements."
+          echo ""
+          /tmp/siri_probe 2>&1 || echo "(probe exited with error)"
+
+      # ── LOGS ─────────────────────────────────────────────────────────────────
+      - name: Logs - siriinferenced
+        run: |
+          echo "=== siriinferenced logs (last 5min) ==="
+          log show \
+            --predicate 'process == "siriinferenced" AND (message CONTAINS "deny" OR message CONTAINS "entitlement" OR message CONTAINS "reject" OR message CONTAINS "connection")' \
+            --last 5m --info --debug 2>/dev/null | head -60 || echo "(none)"
+
+          echo ""
+          echo "=== All siriinferenced connection events ==="
+          log show \
+            --predicate 'process == "siriinferenced"' \
+            --last 5m --info 2>/dev/null | head -80 || echo "(none)"
+        continue-on-error: true
+
+      - name: Logs - assistantd / siri.context
+        run: |
+          echo "=== assistantd logs (last 5min) ==="
+          log show \
+            --predicate 'process == "assistantd" AND (message CONTAINS "deny" OR message CONTAINS "entitlement" OR message CONTAINS "connection" OR message CONTAINS "XPC")' \
+            --last 5m --info --debug 2>/dev/null | head -60 || echo "(none)"
+
+          echo ""
+          echo "=== siriknowledged logs ==="
+          log show \
+            --predicate 'process == "siriknowledged"' \
+            --last 5m --info 2>/dev/null | head -40 || echo "(none)"
+
+          echo ""
+          echo "=== Any siri-related denial logs ==="
+          log show \
+            --predicate 'message CONTAINS "siri" AND (message CONTAINS "deny" OR message CONTAINS "entitlement" OR message CONTAINS "reject")' \
+            --last 5m --info --debug 2>/dev/null | head -60 || echo "(none)"
+        continue-on-error: true
+
+      # ── SUMMARY ──────────────────────────────────────────────────────────────
+      - name: Summary
+        run: |
+          echo "=== SIRI XPC PROBE SUMMARY ==="
+          echo "Platform: macOS $(sw_vers -productVersion) ($(sw_vers -buildVersion))"
+          echo "Date: $(date)"
+          echo ""
+          echo "Target daemons:"
+          echo "  siriinferenced  — on-device Siri ML inference"
+          echo "  siri.context.service — personal context (contacts/calendar/messages)"
+          echo "  siriknowledged  — Siri knowledge queries"
+          echo "  siriactionsd    — Siri action dispatch"
+          echo ""
+          echo "KEY:"
+          echo "  TIMEOUT (4-8s) = accepted connection, NO entitlement check = BYPASS"
+          echo "  INTERRUPTED    = rejected at connect time (correct, not a finding)"
+          echo "  INVALIDATED    = service not found or name incorrect"
+          echo "  PING REPLY     = method call completed (definite bypass + data access)"
+          echo ""
+          echo "Search this log for 'TIMEOUT' or 'PING REPLY' to find any bypass."
+          echo "com.apple.siri.context.service accepting = HIGH severity (contacts/calendar leak)"
