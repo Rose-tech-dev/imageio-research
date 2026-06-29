@@ -1,0 +1,97 @@
+name: CoreDuet + PCC Zero-Day Hunt
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'coreduet_xpc_probe.swift'
+      - 'privatecloudcompute_probe.swift'
+
+jobs:
+
+  # ── macOS 15 (baseline — known service names) ─────────────────────────────
+  coreduet-macos15:
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System info
+        run: sw_vers && echo "UID: $(id -u)" && echo "SIP: $(csrutil status)"
+
+      - name: List CoreDuet-related launchd services
+        run: |
+          echo "=== Running CoreDuet / coreduet services ==="
+          launchctl list | grep -i "coreduet\|duet\|proactive\|cascade" || echo "(none)"
+
+      - name: Compile + run CoreDuet probe
+        timeout-minutes: 5
+        run: |
+          swiftc coreduet_xpc_probe.swift -o /tmp/coreduet_probe 2>&1
+          /tmp/coreduet_probe 2>&1
+        continue-on-error: true
+
+      - name: Rejection logs
+        run: |
+          log show --predicate 'message CONTAINS "Rejecting connection" AND message CONTAINS "coreduet"' \
+            --last 5m --info 2>/dev/null | head -20 || echo "(none)"
+        continue-on-error: true
+
+  # ── macOS 26 (main target — PCC present + new daemons) ────────────────────
+  coreduet-pcc-macos26:
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System info
+        run: sw_vers && echo "UID: $(id -u)" && echo "SIP: $(csrutil status)"
+
+      - name: Enumerate new macOS 26 daemons
+        run: |
+          echo "=== All running launchd services (macOS 26) ==="
+          launchctl list | sort | grep "com.apple" | grep -v "^-" | awk '{print $3}' | sort
+
+          echo ""
+          echo "=== PCC / privatecloudcompute services ==="
+          launchctl list | grep -i "privatecloudcompute\|pcc" || echo "(none)"
+
+          echo ""
+          echo "=== Intelligence / AI related services ==="
+          launchctl list | grep -i "intelligence\|osint\|siri\|coreduet\|suggest\|proactive\|writing" || echo "(none)"
+
+          echo ""
+          echo "=== New LaunchDaemons plists (macOS 26) ==="
+          find /System/Library/LaunchDaemons -name "*.plist" | \
+            xargs grep -l "privatecloudcompute\|AIKit\|PrivateCloud" 2>/dev/null || echo "(none)"
+
+      - name: Compile + run CoreDuet probe
+        timeout-minutes: 6
+        run: |
+          echo "=== CoreDuet XPC probe on macOS 26 ==="
+          swiftc coreduet_xpc_probe.swift -o /tmp/coreduet_probe 2>&1
+          /tmp/coreduet_probe 2>&1
+        continue-on-error: true
+
+      - name: Compile + run Private Cloud Compute probe
+        timeout-minutes: 6
+        run: |
+          echo "=== Private Cloud Compute XPC probe on macOS 26 ==="
+          swiftc privatecloudcompute_probe.swift -o /tmp/pcc_probe 2>&1
+          /tmp/pcc_probe 2>&1
+        continue-on-error: true
+
+      - name: Dump PCC plist MachServices
+        run: |
+          echo "=== privatecloudcomputed plist ==="
+          find /System/Library/LaunchDaemons /System/Library/LaunchAgents \
+            -name "*privatecloudcompute*" -o -name "*pcc*" 2>/dev/null | \
+            while read f; do echo "--- $f ---"; /usr/libexec/PlistBuddy -c Print "$f" 2>/dev/null || plutil -p "$f" 2>/dev/null; done || echo "(no plist found)"
+        continue-on-error: true
+
+      - name: Rejection logs (control cases)
+        run: |
+          log show \
+            --predicate 'message CONTAINS "Rejecting connection" AND (message CONTAINS "coreduet" OR message CONTAINS "privatecloudcompute")' \
+            --last 10m --info 2>/dev/null | head -20 || echo "(none)"
+        continue-on-error: true
