@@ -1,0 +1,39 @@
+name: New macOS 26 Target Probe (callintelligenced, biomed, coreduetd)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe-macos26:
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System info
+        run: sw_vers && echo "UID=$(id -u)" && csrutil status
+
+      - name: Verify target services are running
+        run: |
+          echo "=== Target service status ==="
+          launchctl list | grep -E "callintelligenced|coreduetd|biomed|intelligentroutingd" || echo "(none found)"
+
+      - name: Compile probe
+        run: swiftc new_targets_probe.swift -o /tmp/new_targets_probe 2>&1
+
+      - name: Run probe
+        timeout-minutes: 10
+        run: /tmp/new_targets_probe 2>&1
+
+      - name: Rejection logs
+        run: |
+          log show --predicate 'message CONTAINS "Rejecting connection" AND (message CONTAINS "callintelligence" OR message CONTAINS "biome" OR message CONTAINS "coreduet" OR message CONTAINS "intelligentroutingd")' --last 10m --info 2>/dev/null | head -30 || echo "(none)"
+        continue-on-error: true
+
+      - name: siriinferenced and siri.context.service probe (bonus)
+        timeout-minutes: 5
+        run: |
+          echo "=== siriinferenced + siri.context.service (PID 543 confirmed running) ==="
+          swiftc siriinferenced_probe.swift -o /tmp/siri_probe 2>&1
+          /tmp/siri_probe 2>&1
+        continue-on-error: true
