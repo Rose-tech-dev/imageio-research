@@ -1,0 +1,128 @@
+name: macOS 26 New Daemon Plist Dump
+
+on:
+  workflow_dispatch:
+
+jobs:
+  plist-dump:
+    runs-on: macos-26
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System info
+        run: sw_vers && echo "UID=$(id -u)"
+
+      - name: callintelligenced plist
+        run: |
+          echo "=== callintelligenced (LaunchAgents) ==="
+          for d in /System/Library/LaunchAgents /System/Library/LaunchDaemons; do
+            f="$d/com.apple.callintelligenced.plist"
+            [ -f "$f" ] && plutil -p "$f" || true
+          done
+        continue-on-error: true
+
+      - name: intelligencetasksd plist
+        run: |
+          echo "=== intelligencetasksd ==="
+          for d in /System/Library/LaunchAgents /System/Library/LaunchDaemons; do
+            f="$d/com.apple.intelligencetasksd.plist"
+            [ -f "$f" ] && plutil -p "$f" || true
+          done
+        continue-on-error: true
+
+      - name: intelligentroutingd plist
+        run: |
+          echo "=== intelligentroutingd ==="
+          for d in /System/Library/LaunchAgents /System/Library/LaunchDaemons; do
+            f="$d/com.apple.intelligentroutingd.plist"
+            [ -f "$f" ] && plutil -p "$f" || true
+          done
+        continue-on-error: true
+
+      - name: biomed plist (Biome user activity DB)
+        run: |
+          echo "=== biomed ==="
+          for d in /System/Library/LaunchAgents /System/Library/LaunchDaemons; do
+            f="$d/com.apple.biomed.plist"
+            [ -f "$f" ] && plutil -p "$f" || true
+          done
+        continue-on-error: true
+
+      - name: coreduetd plist (find real MachService name)
+        run: |
+          echo "=== coreduetd ==="
+          for d in /System/Library/LaunchAgents /System/Library/LaunchDaemons; do
+            f="$d/com.apple.coreduetd.plist"
+            [ -f "$f" ] && plutil -p "$f" || true
+          done
+          echo ""
+          echo "=== All coreduet-related plists ==="
+          find /System/Library/LaunchAgents /System/Library/LaunchDaemons -name "*coreduet*" -o -name "*duet*" 2>/dev/null | while read f; do
+            echo "--- $f ---"
+            plutil -p "$f" 2>/dev/null | head -30 || true
+          done
+        continue-on-error: true
+
+      - name: siriinferenced full plist
+        run: |
+          echo "=== siriinferenced ==="
+          f="/System/Library/LaunchAgents/com.apple.siriinferenced.plist"
+          [ -f "$f" ] && plutil -p "$f" || echo "(not found)"
+        continue-on-error: true
+
+      - name: siri.context.service plist
+        run: |
+          echo "=== siri.context.service ==="
+          find /System/Library/LaunchAgents /System/Library/LaunchDaemons -name "*siri.context*" 2>/dev/null | while read f; do
+            echo "--- $f ---"
+            plutil -p "$f" 2>/dev/null || true
+          done || echo "(not found)"
+        continue-on-error: true
+
+      - name: callintelligenced strings (method names)
+        run: |
+          echo "=== callintelligenced binary strings (XPC methods) ==="
+          bin=$(find /usr/libexec /System/Library -name "callintelligenced" 2>/dev/null | head -1)
+          if [ -n "$bin" ]; then
+            echo "Binary: $bin"
+            strings "$bin" | grep -E "^[a-z][A-Za-z]+WithReply|^[a-z][A-Za-z]+Handler|MachService|com\.apple\." | sort -u | head -60
+          else
+            echo "(binary not found)"
+          fi
+        continue-on-error: true
+
+      - name: intelligencetasksd strings (method names)
+        run: |
+          echo "=== intelligencetasksd binary strings ==="
+          bin=$(find /usr/libexec /System/Library -name "intelligencetasksd" 2>/dev/null | head -1)
+          if [ -n "$bin" ]; then
+            echo "Binary: $bin"
+            strings "$bin" | grep -E "^[a-z][A-Za-z]+WithReply|^[a-z][A-Za-z]+Handler|MachService|com\.apple\." | sort -u | head -60
+          else
+            echo "(binary not found)"
+          fi
+        continue-on-error: true
+
+      - name: CallIntelligence framework protocol dump
+        run: |
+          echo "=== CallIntelligence.framework strings ==="
+          fw="/System/Library/PrivateFrameworks/CallIntelligence.framework/CallIntelligence"
+          if [ -f "$fw" ]; then
+            strings "$fw" | grep -E "^[a-z][A-Za-z]+WithReply|^[a-z][A-Za-z]+Handler|MachService|com\.apple\.call" | sort -u | head -80
+          else
+            echo "(framework not found at $fw)"
+            find /System/Library/PrivateFrameworks -name "CallIntelligence*" 2>/dev/null
+          fi
+        continue-on-error: true
+
+      - name: IntelligenceTasksEngine framework strings
+        run: |
+          echo "=== IntelligenceTasksEngine.framework strings ==="
+          fw="/System/Library/PrivateFrameworks/IntelligenceTasksEngine.framework/IntelligenceTasksEngine"
+          if [ -f "$fw" ]; then
+            strings "$fw" | grep -E "^[a-z][A-Za-z]+WithReply|^[a-z][A-Za-z]+Handler|MachService|com\.apple\." | sort -u | head -80
+          else
+            echo "(not found)"
+          fi
+        continue-on-error: true
