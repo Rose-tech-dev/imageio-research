@@ -11,55 +11,30 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: System info
-        run: sw_vers && echo "UID: $(id -u)" && echo "SIP: $(csrutil status)"
+        run: sw_vers && echo "UID=$(id -u)" && csrutil status
 
       - name: All running com.apple services
-        run: |
-          echo "=== All com.apple launchd services ==="
-          launchctl list | awk '{print $3}' | grep "^com\.apple\." | sort -u
+        run: launchctl list | awk '{print $3}' | grep "^com\.apple\." | sort -u
 
-      - name: All LaunchDaemon plists + their MachServices
+      - name: New PrivateFrameworks with AI or Intelligence
         run: |
-          echo "=== LaunchDaemons with MachServices keys ==="
-          for plist in /System/Library/LaunchDaemons/*.plist; do
-            services=$(plutil -extract MachServices raw -o - "$plist" 2>/dev/null || true)
-            if [ -n "$services" ]; then
-              echo "--- $(basename $plist) ---"
-              plutil -p "$plist" 2>/dev/null | grep -A 1 "MachServices" | head -20
-            fi
-          done
-        continue-on-error: true
-
-      - name: New AI / Intelligence private frameworks
-        run: |
-          echo "=== PrivateFrameworks with Intelligence/AI/PCC ==="
-          ls /System/Library/PrivateFrameworks/ | grep -i \
-            "intelligence\|OSIntel\|privatecloudcompute\|AIKit\|GenAI\|FoundationModel\|OnDeviceModel\|WritingTools\|Siri\|CoreDuet\|proactive" \
-            | sort
-
+          ls /System/Library/PrivateFrameworks/ | grep -i "intelligence\|OSIntel\|privatecloudcompute\|AIKit\|GenAI\|FoundationModel\|OnDeviceModel\|WritingTools\|CoreDuet\|proactive" | sort
           echo ""
-          echo "=== New macOS 26 binaries in /usr/libexec ==="
-          ls /usr/libexec/ | grep -i \
-            "intelligence\|prediction\|privatecloud\|siri\|duet\|suggest\|writing" \
-            | sort
+          ls /usr/libexec/ | grep -i "intelligence\|prediction\|privatecloud\|siri\|duet\|suggest\|writing" | sort
 
-      - name: Private Cloud Compute full surface
+      - name: Private Cloud Compute binary map
         run: |
           echo "=== PCC binaries ==="
-          find /System /usr/libexec /usr/bin -name "*privatecloudcompute*" \
-                -o -name "*PrivateCloudCompute*" \
-                -o -name "*pcc*" 2>/dev/null | sort || echo "(none)"
-
+          find /System /usr/libexec /usr/bin -name "*privatecloudcompute*" -o -name "*PrivateCloudCompute*" 2>/dev/null | sort || echo "(none)"
           echo ""
           echo "=== PCC LaunchDaemons ==="
-          find /System/Library/LaunchDaemons /System/Library/LaunchAgents \
-            -name "*privatecloudcompute*" -o -name "*privatecloud*" 2>/dev/null | \
-            while read f; do
-              echo "--- $f ---"
-              plutil -p "$f" 2>/dev/null | grep -E "MachServices|Label|Program" | head -10
-            done || echo "(none)"
+          find /System/Library/LaunchDaemons /System/Library/LaunchAgents -name "*privatecloudcompute*" -o -name "*privatecloud*" 2>/dev/null | while read f; do
+            echo "--- $f ---"
+            plutil -p "$f" 2>/dev/null | grep -A 2 "MachServices\|Label\|Program" | head -15 || true
+          done || echo "(none)"
+        continue-on-error: true
 
-      - name: Siri + Intelligence daemon MachService dump
+      - name: Siri and Intelligence daemon MachService dump
         run: |
           for plist in \
             /System/Library/LaunchDaemons/com.apple.siriknowledged.plist \
@@ -72,7 +47,7 @@ jobs:
             /System/Library/LaunchAgents/com.apple.privatecloudcomputed.plist; do
             if [ -f "$plist" ]; then
               echo "=== $plist ==="
-              plutil -p "$plist" 2>/dev/null | grep -E "MachServices|Label|UserName|RunAtLoad" | head -20
+              plutil -p "$plist" 2>/dev/null | grep -A 2 "MachServices\|Label\|UserName\|RunAtLoad" | head -30 || true
             fi
           done
         continue-on-error: true
@@ -81,24 +56,20 @@ jobs:
         run: |
           echo "=== CoreDuet services ==="
           launchctl list | grep -i "coreduet\|duet" || echo "(none running)"
-
-          for plist in \
-            /System/Library/LaunchDaemons/com.apple.coreduetd.plist \
-            /System/Library/LaunchAgents/com.apple.coreduetd.plist; do
+          for plist in /System/Library/LaunchDaemons/com.apple.coreduetd.plist /System/Library/LaunchAgents/com.apple.coreduetd.plist; do
             if [ -f "$plist" ]; then
               echo "=== $plist ==="
-              plutil -p "$plist" 2>/dev/null | head -40
+              plutil -p "$plist" 2>/dev/null | head -40 || true
             fi
           done
         continue-on-error: true
 
-      - name: Find all XPC services with entitlement keys
+      - name: LaunchDaemons with MachServices
         run: |
-          echo "=== LaunchDaemons with entitlement requirements ==="
-          grep -rl "JoinExistingSession\|EntitlementKey\|AssertionType\|com.apple.security" \
-            /System/Library/LaunchDaemons/*.plist 2>/dev/null | \
-            while read f; do
-              echo "--- $(basename $f) ---"
-              plutil -p "$f" 2>/dev/null | grep -E "Entitlement|security\." | head -5
-            done | head -60
+          for plist in /System/Library/LaunchDaemons/*.plist; do
+            if plutil -p "$plist" 2>/dev/null | grep -q "MachServices"; then
+              echo "--- $(basename $plist) ---"
+              plutil -p "$plist" 2>/dev/null | grep -A 1 "MachServices" | head -10 || true
+            fi
+          done | head -200
         continue-on-error: true
